@@ -21,6 +21,27 @@ import {
 } from "../utils/timezone";
 import { wideEdit } from "../utils/uiPrefs";
 
+// Curated image models: the ones measured to decode on this panel. A model that
+// cannot be decoded here is not offered, so the list is a shortlist of what
+// works rather than everything the provider advertises. Free text is still
+// accepted for anything else.
+// Neutral labels: measured draw time only. No "best" markers -- the order here
+// is the owner's, and the timings are observations, not a recommendation.
+const imageModelOptions = [
+  { title: "Seedream 5.0 Pro (~77s)", value: "bytedance-seed/seedream-5-0-pro" },
+  { title: "Seedream 5.0 Flash (~16s)", value: "bytedance-seed/seedream-5-0-flash" },
+  { title: "Gemini 3.1 Flash Image", value: "google/gemini-3.1-flash-image" },
+  { title: "Gemini 3.1 Flash Lite Image", value: "google/gemini-3.1-flash-lite-image" },
+  { title: "MAI Image 2.6 Flash", value: "microsoft/mai-image-2.6-flash" },
+  { title: "Krea 2 Medium Turbo", value: "krea/krea-2-medium-turbo" },
+];
+// Only ids confirmed present in the provider catalogue. An invented id here
+// would fail the daily cycle with an opaque "model not found".
+const writerModelOptions = [
+  { title: "Gemini 3.1 Flash Lite", value: "google/gemini-3.1-flash-lite" },
+  { title: "Gemini 3 Flash Preview", value: "google/gemini-3-flash-preview" },
+];
+
 const settingsStore = useSettingsStore();
 const appStore = useAppStore();
 
@@ -208,7 +229,10 @@ const rotationOptions = [
 ];
 
 const rotationModeOptions = computed(() => {
-  const options = [{ title: "URL - Fetch image from URL", value: "url" }];
+  const options = [
+    { title: "AI - generate a picture every day", value: "ai" },
+    { title: "URL - Fetch image from URL", value: "url" },
+  ];
   if (appStore.systemInfo.sdcard_inserted || appStore.systemInfo.has_flash_storage) {
     options.unshift({ title: "Storage - Rotate through images", value: "storage" });
   }
@@ -219,6 +243,127 @@ const sdRotationModeOptions = [
   { title: "Random - Shuffle images", value: "random" },
   { title: "Sequential - In sequence", value: "sequential" },
 ];
+
+// v-combobox returns the whole option object (return-object defaults to true,
+// and item-value is documented as unsupported on combobox). Binding v-model
+// straight to a string field therefore stored {title, value}, which the device
+// silently ignored as "not a string" -- the save looked successful and the field
+// snapped back on reload. These proxies display the option but store the id, and
+// pass free-typed text through unchanged.
+function optionProxy(options, field) {
+  return computed({
+    get() {
+      const id = settingsStore.deviceSettings[field];
+      return options.find((o) => o.value === id) || id;
+    },
+    set(v) {
+      settingsStore.deviceSettings[field] = v && typeof v === "object" ? v.value : v;
+    },
+  });
+}
+// If the order has not arrived (older firmware, or a cached /api/config), still
+// render the model actually in use rather than an empty box: an empty list looks
+// like a broken page, and gives no hint which half is missing.
+const aiModelOrderRows = computed(() => {
+  const list = settingsStore.deviceSettings.aiModelOrder || [];
+  if (list.length) return list;
+  const current = settingsStore.deviceSettings.aiImageModel;
+  return current ? [current] : [];
+});
+
+const modelLabel = (id) =>
+  imageModelOptions.find((o) => o.value === id)?.title || id || "(empty)";
+
+// Reordering is a discrete choice, not a half-finished form edit, so it is
+// applied immediately. Requiring Save meant a user could reorder, press
+// Generate now, and silently get the previous model -- with the reload
+// afterwards appearing to undo the move.
+async function applyModelOrder(list) {
+  try {
+    const r = await fetch("/api/config", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ai_model_order: list }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || body.status === "error") {
+      throw new Error(body.message || `HTTP ${r.status}`);
+    }
+    // Keep the baseline in step so the next Save does not resend it, and take
+    // the head the device derived.
+    await settingsStore.loadDeviceSettings();
+  } catch (e) {
+    saveError.value = true;
+    saveMessage.value = `Could not apply the model order: ${e.message}`;
+    setTimeout(() => (saveError.value = false), 6000);
+    await settingsStore.loadDeviceSettings();  // show what the device actually has
+  }
+}
+
+async function moveModel(index, delta) {
+  const list = [...settingsStore.deviceSettings.aiModelOrder];
+  const to = index + delta;
+  if (to < 0 || to >= list.length) return;
+  [list[index], list[to]] = [list[to], list[index]];
+  settingsStore.deviceSettings.aiModelOrder = list;
+  await applyModelOrder(list);
+}
+const aiWriterModelProxy = optionProxy(writerModelOptions, "aiWriterModel");
+
+const aiRunning = ref(false);
+const aiStateText = ref("");
+const aiError = ref("");
+const AI_ERROR_MEANINGS = {
+  401: "The endpoint rejected the key. Check the API key above.",
+  402: "The account is out of credit. Top it up at the provider; the frame will retry on its next cycle.",
+  403: "The endpoint refused the request (permissions or policy).",
+  429: "The provider is rate-limiting. The frame will try again on its next cycle.",
+};
+
+// Runs one cycle now and reports what happened, so a config change can be seen
+// rather than waited for until tomorrow morning.
+async function runAiGeneration() {
+  aiRunning.value = true;
+  aiError.value = "";
+  aiStateText.value = "starting";
+  try {
+    const started = await fetch("/api/ai/daily", { method: "POST" });
+    if (!started.ok) {
+      throw new Error(`The frame refused the request (HTTP ${started.status}).`);
+    }
+    // Poll until the worker leaves a terminal state. The cycle takes 1-2.5
+    // minutes on the slower models.
+    for (let i = 0; i < 90; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const s = await (await fetch("/api/ai/status")).json();
+      const secs = s.elapsed_ms ? ` · ${Math.round(s.elapsed_ms / 1000)}s` : "";
+      aiStateText.value = `${s.state}${secs}`;
+      if (!s.busy && (s.state === "success" || s.state === "error" || s.state === "idle")) {
+        if (s.state === "error") {
+          // The device extracts the provider's own message, which is specific
+          // ("Key limit exceeded (weekly limit) ... resets ..."). Canned text is
+          // only for when it says nothing.
+          aiError.value = s.error || AI_ERROR_MEANINGS[s.http_status] || "Generation failed.";
+        }
+        break;
+      }
+    }
+    // A capability or repeated-transient failure may have moved the frame down
+    // its preference list; reload so the model field shows what is really in use.
+    await settingsStore.loadDeviceSettings();
+  } catch (e) {
+    aiError.value = e.message;
+  } finally {
+    aiRunning.value = false;
+  }
+}
+
+const templateInvalid = computed(() => {
+  const t = settingsStore.deviceSettings.aiPromptTemplate;
+  return t !== "" && !t.includes("{{weather}}");
+});
+
+const templateLength = computed(() => settingsStore.deviceSettings.aiPromptTemplate.length);
 
 const saving = ref(false);
 const saveSuccess = ref(false);
@@ -1067,43 +1212,212 @@ async function performFactoryReset() {
           <!-- AI Generation Tab -->
           <v-tabs-window-item value="ai">
             <v-alert type="info" variant="tonal" density="compact" class="mt-2 mb-4">
-              API keys are used for client-side AI image generation when uploading images.
+              The frame generates its own picture once a day. These settings are used on the
+              device, not by this browser.
             </v-alert>
 
+            <div class="text-subtitle-2 mb-1">Provider</div>
             <v-text-field
-              v-model="settingsStore.deviceSettings.aiCredentials.openaiApiKey"
-              label="OpenAI API Key"
+              v-model="settingsStore.deviceSettings.aiApiKey"
+              label="API key"
               variant="outlined"
               type="password"
-              hint="sk-..."
+              hint="Stored on the frame and sent only to the endpoint below."
               persistent-hint
-              class="mb-2"
+              class="mb-4"
             />
-            <div class="text-caption text-grey ml-2 mb-4">
-              Get your API key at
-              <a
-                href="https://platform.openai.com/api-keys"
-                target="_blank"
-                class="text-primary text-decoration-none"
-                >platform.openai.com</a
-              >
+
+            <v-row dense>
+              <v-col cols="12" md="6">
+                <div class="text-caption text-grey mb-1">
+                  Image model preference — the top entry is the one in use. Use the arrows to
+                  reorder; a failing model is moved to the bottom automatically.
+                </div>
+                <v-list density="compact" class="border rounded pa-0">
+                  <v-list-item
+                    v-for="(id, i) in aiModelOrderRows"
+                    :key="id"
+                    class="py-1"
+                  >
+                    <v-list-item-title class="text-body-2">
+                      {{ modelLabel(id) }}
+                      <v-chip v-if="i === 0" size="x-small" color="primary" variant="flat" class="ml-2">
+                        in use
+                      </v-chip>
+                    </v-list-item-title>
+                    <template #append>
+                      <v-btn
+                        icon="mdi-arrow-up"
+                        size="x-small"
+                        variant="text"
+                        :disabled="i === 0"
+                        @click="moveModel(i, -1)"
+                      />
+                      <v-btn
+                        icon="mdi-arrow-down"
+                        size="x-small"
+                        variant="text"
+                        :disabled="aiModelOrderRows.length > 1 && i === aiModelOrderRows.length - 1"
+                        @click="moveModel(i, 1)"
+                      />
+                    </template>
+                  </v-list-item>
+                </v-list>
+              </v-col>
+              <v-col cols="12" md="6">
+                <v-text-field
+                  v-model="settingsStore.deviceSettings.aiUrl"
+                  label="Image endpoint"
+                  variant="outlined"
+                  density="compact"
+                  hint="Any OpenAI-compatible images endpoint."
+                  persistent-hint
+                />
+              </v-col>
+            </v-row>
+
+            <v-row dense class="mt-2">
+              <v-col cols="12" md="6">
+                <v-combobox
+                  v-model="aiWriterModelProxy"
+                  :items="writerModelOptions"
+                  item-title="title"
+                  item-value="value"
+                  label="Prompt writer model"
+                  variant="outlined"
+                  density="compact"
+                  hint="Turns the weather into the image prompt."
+                  persistent-hint
+                />
+              </v-col>
+              <v-col cols="12" md="6">
+                <v-text-field
+                  v-model="settingsStore.deviceSettings.aiWriterUrl"
+                  label="Prompt writer endpoint"
+                  variant="outlined"
+                  density="compact"
+                  hint="Any OpenAI-compatible chat completions endpoint."
+                  persistent-hint
+                />
+              </v-col>
+            </v-row>
+
+            <v-divider class="my-5" />
+
+            <div class="text-subtitle-2 mb-1">Location</div>
+            <v-row dense>
+              <v-col cols="12" md="3">
+                <v-text-field
+                  v-model.number="settingsStore.deviceSettings.weatherLatitude"
+                  label="Latitude"
+                  variant="outlined"
+                  density="compact"
+                  type="number"
+                />
+              </v-col>
+              <v-col cols="12" md="3">
+                <v-text-field
+                  v-model.number="settingsStore.deviceSettings.weatherLongitude"
+                  label="Longitude"
+                  variant="outlined"
+                  density="compact"
+                  type="number"
+                />
+              </v-col>
+              <v-col cols="12" md="6">
+                <v-text-field
+                  v-model="settingsStore.deviceSettings.aiPlace"
+                  label="Place name used in the prompt"
+                  variant="outlined"
+                  density="compact"
+                  hint="Substituted for the location placeholder in the template, e.g. Surrey, England"
+                  persistent-hint
+                />
+              </v-col>
+            </v-row>
+            <div class="text-caption text-grey mb-2">
+              Coordinates drive the forecast; the place name is what the prompt is written for.
+              They are kept together because they must agree.
             </div>
 
-            <v-text-field
-              v-model="settingsStore.deviceSettings.aiCredentials.googleApiKey"
-              label="Google Gemini API Key"
+            <v-divider class="my-5" />
+
+            <div class="text-subtitle-2 mb-1">Generation</div>
+            <p class="text-caption text-grey mb-3">
+              Whether the frame generates a picture on a schedule is the Rotation Mode setting in
+              Auto Rotate; this tab configures how that picture is produced. Rotation Mode is
+              currently
+              <strong>{{ settingsStore.deviceSettings.rotationMode }}</strong>.
+              <template v-if="!settingsStore.deviceSettings.autoRotate">
+                <strong>Auto Rotate is off, so nothing runs on a schedule.</strong>
+              </template>
+            </p>
+            <p class="text-caption text-grey mb-3">
+              The model above is the one currently in use. The frame keeps the last model that
+              worked and moves down its fallback list only when one fails, so this field can change
+              on its own.
+            </p>
+
+            <v-btn
+              color="primary"
+              variant="tonal"
+              prepend-icon="mdi-image-sync"
+              :loading="aiRunning"
+              class="mb-3"
+              @click="runAiGeneration"
+            >
+              Generate now
+            </v-btn>
+            <div v-if="aiStateText" class="text-caption text-grey mb-2">
+              {{ aiStateText }}
+            </div>
+            <v-alert v-if="aiError" type="error" variant="tonal" density="compact" class="mb-2">
+              {{ aiError }}
+            </v-alert>
+
+            <v-divider class="my-5" />
+
+            <div class="d-flex align-center mb-1">
+              <div class="text-subtitle-2">Prompt template</div>
+              <v-spacer />
+              <span class="text-caption text-grey">{{ templateLength }} / 8192</span>
+            </div>
+            <p class="text-caption text-grey mb-2">
+              Sent to the prompt writer with the weather substituted for
+              <code v-pre>{{weather}}</code> and the location for
+              <code v-pre>{{place}}</code>. Leave empty to use the built-in template.
+            </p>
+            <v-textarea
+              v-model="settingsStore.deviceSettings.aiPromptTemplate"
               variant="outlined"
-              type="password"
+              rows="12"
+              auto-grow
+              spellcheck="false"
               class="mb-2"
+              :error-messages="
+                templateInvalid ? 'The template must contain the {{weather}} placeholder' : ''
+              "
             />
-            <div class="text-caption text-grey ml-2 mb-4">
-              Get your API key at
-              <a
-                href="https://aistudio.google.com/app/apikey"
-                target="_blank"
-                class="text-primary text-decoration-none"
-                >aistudio.google.com</a
+            <div class="d-flex align-center">
+              <v-btn
+                variant="text"
+                size="small"
+                prepend-icon="mdi-restore"
+                @click="
+                  settingsStore.deviceSettings.aiPromptTemplate =
+                    settingsStore.deviceSettings.aiPromptTemplateDefault
+                "
               >
+                Load built-in default
+              </v-btn>
+              <v-spacer />
+              <v-btn
+                variant="text"
+                size="small"
+                @click="settingsStore.deviceSettings.aiPromptTemplate = ''"
+              >
+                Use built-in
+              </v-btn>
             </div>
           </v-tabs-window-item>
 

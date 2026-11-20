@@ -6,7 +6,14 @@
 // Uncomment to debug deep sleep wake
 // #define DEBUG_DEEP_SLEEP_WAKE
 
-typedef enum { ROTATION_MODE_STORAGE = 0, ROTATION_MODE_URL = 1 } rotation_mode_t;
+// What a rotation tick should put on the panel. The cron schedule decides *when*;
+// this decides *what*. Adding a value here means touching every if/ternary that
+// enumerates the mode -- there is no switch anywhere for the compiler to catch it.
+typedef enum {
+    ROTATION_MODE_STORAGE = 0,  // rotate through enabled albums on local storage
+    ROTATION_MODE_URL = 1,      // fetch the configured image URL
+    ROTATION_MODE_AI = 2        // generate today's picture (weather -> prompt -> image)
+} rotation_mode_t;
 
 typedef enum { SD_ROTATION_RANDOM = 0, SD_ROTATION_SEQUENTIAL = 1 } sd_rotation_mode_t;
 
@@ -181,10 +188,143 @@ typedef enum { IP_MODE_DHCP = 0, IP_MODE_STATIC = 1 } ip_mode_t;
 // Home Assistant
 #define NVS_HA_URL_KEY "ha_url"
 
-// AI API Keys (for webapp client use)
+// AI API Keys (webapp client use; the openai key slot is also the bearer token
+// for on-device generation -- see ai_gen.c)
 #define AI_API_KEY_MAX_LEN 256
-#define NVS_OPENAI_API_KEY_KEY "openai_key"
-#define NVS_GOOGLE_API_KEY_KEY "google_key"
+
+// On-device image generation (ai_gen.c).
+//
+// The request shape is OpenRouter's /api/v1/images, whose response is always
+// base64 (there is no URL form), so the device decodes it itself. The endpoint
+// and the image model are configuration rather than constants because they are
+// only meaningful as a pair: pointing at a different endpoint while the model
+// stays pinned is a knob that cannot turn.
+//
+// The 512 tier is chosen deliberately for this hardware: it returns 688x384,
+// which sits under 2x the 800x480 panel and so clears image_processor's
+// forced-1/2 decode gate -- the image is decoded once at full size (0.79 MB
+// RGB888) and upscaled 1.25x, with no down-then-up resample chain.
+#define AI_URL_MAX_LEN 256
+#define AI_MODEL_MAX_LEN 128
+#define DEFAULT_AI_URL "https://openrouter.ai/api/v1/images"
+#define DEFAULT_AI_IMAGE_MODEL "bytedance-seed/seedream-5-0-flash"
+#define AI_GEN_ASPECT_RATIO "16:9"
+#define AI_GEN_RESOLUTION "512"
+// Generation is the slow half of the job -- 16 s measured on the flash tier, 77 s
+// on seedream-5-0-pro, which is why this is not 60 s. It is a per-socket
+// operation timeout, so a slow-but-progressing response still completes.
+#define AI_GEN_TIMEOUT_MS 120000
+// Ceiling on the JSON body, a guard against a runaway read rather than a memory
+// saving: the configured tier answers ~840 KB. Headroom here decides the largest
+// image tier the device can accept.
+#define AI_GEN_RESPONSE_MAX_LEN (3 * 1024 * 1024)
+#define AI_GEN_TASK_STACK 16384
+
+// Upper bound a rotation tick will wait on the AI pipeline. The deep-sleep path
+// sleeps as soon as trigger_image_rotation() returns, so the AI branch blocks on
+// its worker and needs a ceiling: the cycle measures ~54 s, which leaves room for
+// a slower model without letting a wedged socket hold the device awake forever.
+#define AI_ROTATION_TIMEOUT_MS 180000
+
+// Creative direction: free text folded into the prompt writer's system prompt as
+// the owner's standing instructions -- the place to put the fixed parts (where
+// the frame is, what style to lean to, what to avoid) so they can be edited by
+// hand while the daily cycle stays autonomous.
+#define AI_DIRECTION_MAX_LEN 512
+#define NVS_AI_DIRECTION_KEY "ai_dir"
+#define NVS_AI_URL_KEY "ai_url"
+#define NVS_AI_IMAGE_MODEL_KEY "ai_model"
+// The key the frame uses. Separate from the legacy openai_key slot, which the
+// browser's upload dialog uses for client-side generation -- different consumer,
+// different key. Migrated from openai_key at boot when this one is unset, so an
+// already-provisioned frame keeps working.
+#define AI_API_KEY_MAX_LEN 256
+#define NVS_AI_API_KEY_KEY "ai_apikey"
+#define NVS_LEGACY_OPENAI_KEY "openai_key"
+
+// The prompt writer's endpoint and model are config for the same reason the
+// image pair is: they are only meaningful together. Defaults preserve the
+// previous compile-time behaviour.
+#define AI_WRITER_URL_MAX_LEN 256
+#define AI_WRITER_MODEL_MAX_LEN 128
+#define DEFAULT_AI_WRITER_URL "https://openrouter.ai/api/v1/chat/completions"
+#define DEFAULT_AI_WRITER_MODEL "google/gemini-3.1-flash-lite"
+#define NVS_AI_WRITER_URL_KEY "ai_wurl"
+#define NVS_AI_WRITER_MODEL_KEY "ai_wmodel"
+
+// The coarse area the prompt is written for ("the North Downs, Surrey"), as
+// distinct from the precise coordinates the weather API needs. They are kept
+// together in the UI because they must agree, but they are different things.
+#define AI_PLACE_MAX_LEN 128
+// Fallback for a factory-fresh device: the compiled template contains {{place}},
+// and compose_prompt refuses to send an unresolved placeholder, so there has to
+// be a value even before anyone configures one. Matches the lab's default.
+#define DEFAULT_AI_PLACE "Surrey, England"
+#define NVS_AI_PLACE_KEY "ai_place"
+
+// The editable prompt template. Stored as an NVS blob rather than a string:
+// strings cap at 4000 bytes, and the guard on a composed prompt is 8192. Empty
+// means "use the compiled default", so a frame reset or a bad save always has
+// something sane to fall back to.
+#define AI_TEMPLATE_MAX_LEN 8192
+#define NVS_AI_TEMPLATE_KEY "ai_tmpl"
+
+// The model preference order, comma-separated ids. The HEAD is the model in use;
+// choosing a model moves it to the head, and a failure moves it to the tail. One
+// ordered list, so there is no separate "active" field to drift out of step.
+#define AI_MODEL_ORDER_MAX_LEN 1024
+#define AI_MODEL_ORDER_MAX_ENTRIES 8
+#define NVS_AI_MODEL_ORDER_KEY "ai_order"
+#define DEFAULT_AI_MODEL_ORDER                                                                     \
+    "bytedance-seed/seedream-5-0-pro,bytedance-seed/seedream-5-0-flash,"                            \
+    "google/gemini-3.1-flash-image,google/gemini-3.1-flash-lite-image,"                             \
+    "microsoft/mai-image-2.6-flash,krea/krea-2-medium-turbo"
+
+// Consecutive days with no successful autonomous generation before the panel is
+// replaced by a warning. Seven is long enough to ride out an outage and short
+// enough that the frame cannot sit stale for a fortnight without telling anyone.
+#define AI_FAIL_STREAK_WARN_DAYS 7
+#define NVS_AI_FAIL_STREAK_KEY "ai_fdays"
+// Consecutive transient failures (connect/TLS/429/5xx) before the current model
+// is demoted. A capability failure -- output too large to decode, parameters
+// rejected -- demotes immediately, because retrying that model is pointless.
+// The distinction matters: demoting on a single TLS blip would discard a model
+// that works, which is exactly what happened once already.
+#define NVS_AI_MODEL_FAILS_KEY "ai_fails"
+#define IMAGE_MODEL_DEMOTE_AFTER_FAILS 3
+
+// Weather for the daily prompt (weather.c). This is the weather service's
+// location, not a parameter of the generation itself.
+//
+// timezone=auto makes Open-Meteo resolve the zone from the coordinates, so the
+// day it labels as index 0 is correct even if our own clock has not synced --
+// only the *server's* calendar decides which day we get.
+#define OPEN_METEO_FORECAST_URL "https://api.open-meteo.com/v1/forecast"
+// Their one condition of use: identify the client. A generic or shared user agent
+// is how a whole netblock ends up throttled, so this is not optional courtesy.
+#define WEATHER_USER_AGENT "esp32-photoframe/1.0 (+https://github.com/aitjcize/esp32-photoframe)"
+#define WEATHER_TIMEOUT_MS 15000
+#define DEFAULT_WEATHER_LATITUDE 51.2361    // Guildford, Surrey
+#define DEFAULT_WEATHER_LONGITUDE -0.5762
+#define WEATHER_LATITUDE_MIN -90.0
+#define WEATHER_LATITUDE_MAX 90.0
+#define WEATHER_LONGITUDE_MIN -180.0
+#define WEATHER_LONGITUDE_MAX 180.0
+#define NVS_WEATHER_LATITUDE_KEY "wx_lat"
+#define NVS_WEATHER_LONGITUDE_KEY "wx_lon"
+
+// The prompt writer (ai_prompt.c) -- deliberately a different, far cheaper model
+// than the image model. Measured: ~$0.0002 per call against ~$0.045 for the image
+// it goes on to produce, returning in about 2 s.
+#define AI_PROMPT_URL "https://openrouter.ai/api/v1/chat/completions"
+#define AI_PROMPT_MODEL "google/gemini-3.1-flash-lite"
+#define AI_PROMPT_MAX_TOKENS 220
+#define AI_PROMPT_TEMPERATURE 1.0
+#define AI_PROMPT_TIMEOUT_MS 30000
+// Ceiling for the composed system prompt (guidance + owner direction). The prompt
+// is heap-allocated at its exact size, so this is not a truncation limit -- it is
+// a guard that refuses to send something absurd rather than discovering it later.
+#define AI_PROMPT_SYSTEM_MAX 8192
 
 // OTA Configuration
 #define GITHUB_API_URL "https://api.github.com/repos/aitjcize/esp32-photoframe/releases/latest"

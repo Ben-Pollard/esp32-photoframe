@@ -230,3 +230,25 @@ target_link_libraries(
 )
 
 gtest_discover_tests(display_flow_test)
+
+# Weather data block: the exact text handed to the prompt writer. Pure
+# formatting, so no network, cJSON or NVS is involved.
+add_executable(
+  weather_block_test
+  test_weather_block.cpp
+  ../main/weather_block.c
+)
+
+target_include_directories(
+  weather_block_test
+  PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/stubs
+  ${CMAKE_CURRENT_SOURCE_DIR}/../main
+)
+
+target_link_libraries(
+  weather_block_test
+  GTest::gtest_main
+)
+
+gtest_discover_tests(weather_block_test)

@@ -141,11 +141,60 @@ const char *config_manager_get_ha_url(void);
 // AI API Keys
 // ============================================================================
 
-void config_manager_set_openai_api_key(const char *key);
-const char *config_manager_get_openai_api_key(void);
 
-void config_manager_set_google_api_key(const char *key);
-const char *config_manager_get_google_api_key(void);
+
+// Weather location (drives weather.c) and the generation endpoint/model pair plus
+// the owner's standing creative instructions.
+void config_manager_set_weather_latitude(double value);
+double config_manager_get_weather_latitude(void);
+void config_manager_set_weather_longitude(double value);
+double config_manager_get_weather_longitude(void);
+void config_manager_set_ai_url(const char *url);
+const char *config_manager_get_ai_url(void);
+void config_manager_set_ai_image_model(const char *model);
+const char *config_manager_get_ai_image_model(void);
+
+// The key the frame uses. Migrated once from the retired openai_key slot at
+// boot when unset, so devices provisioned before the rename keep working.
+const char *config_manager_get_ai_api_key(void);
+void config_manager_set_ai_api_key(const char *key);
+
+// Prompt-writer endpoint and model. Config for the same reason the image pair
+// is: they only mean anything together.
+const char *config_manager_get_ai_writer_url(void);
+void config_manager_set_ai_writer_url(const char *url);
+const char *config_manager_get_ai_writer_model(void);
+void config_manager_set_ai_writer_model(const char *model);
+
+// Coarse area the prompt is written for, as opposed to the weather coordinates.
+const char *config_manager_get_ai_place(void);
+void config_manager_set_ai_place(const char *place);
+
+// Ordered model preference list, comma-separated. Head = model in use.
+const char *config_manager_get_ai_model_order(void);
+esp_err_t config_manager_set_ai_model_order(const char *csv);
+
+// Consecutive autonomous-generation failures, in days.
+int config_manager_get_ai_fail_streak(void);
+void config_manager_set_ai_fail_streak(int days);
+
+// Editable prompt template. NULL means "use the compiled default".
+const char *config_manager_get_ai_template(void);
+esp_err_t config_manager_set_ai_template(const char *tmpl);
+void config_manager_clear_ai_template(void);
+/**
+ * @brief Consecutive transient generation failures against the current model.
+ *
+ * Persisted because the device deep-sleeps: a counter in RAM would reset every
+ * day and "eventually demote" would never arrive.
+ */
+int config_manager_get_ai_model_fails(void);
+void config_manager_set_ai_model_fails(int fails);
+void config_manager_set_ai_direction(const char *direction);
+const char *config_manager_get_ai_direction(void);
+
+// Canonical mode name shared by the logs and the API serialisation.
+const char *config_manager_rotation_mode_str(rotation_mode_t mode);
 
 // ============================================================================
 // Power

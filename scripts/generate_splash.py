@@ -7,7 +7,7 @@ process-cli to dither and produce EPDGZ. Layout adapts to landscape/portrait.
 
 Dependencies:
   pip install qrcode
-  rsvg-convert (librsvg2-bin on Ubuntu, librsvg on macOS)
+  rsvg-convert (librsvg2-bin on Ubuntu, librsvg on macOS), or pip install cairosvg
   node + process-cli (npm ci in process-cli/)
 """
 
@@ -28,7 +28,6 @@ except ImportError:
 from boards import BOARD_DIMENSIONS, BOARD_DISPLAY_TYPE
 
 # App download URL
-APP_URL = "https://aitjcize.github.io/esp32-photoframe/#companion-app"
 
 # QR code module size in SVG units
 QR_MODULE_SIZE = 4
@@ -89,38 +88,27 @@ def generate_splash_svg(width: int, height: int) -> tuple:
     """Generate splash screen SVG. Returns (svg_content, wifi_qr_x, wifi_qr_y, wifi_qr_size)."""
     is_landscape = width > height
 
-    # Generate app QR code
-    app_qr_path, app_qr_size = generate_qr_svg_path(APP_URL)
-
     L = LAYOUT["landscape" if is_landscape else "portrait"]
 
     icon_scale = min(width, height) * L["icon_size"]
     icon_x = width / 2
     icon_y = height * L["icon_y"]
 
-    qr_scale = min(width * L["qr_size"], height * L["qr_size"]) / app_qr_size
+    # One QR only: the frame's own setup hotspot. The companion-app QR was
+    # removed -- this firmware has drifted from that app, so pointing at it would
+    # send the owner somewhere that does not match the device in their hands.
+    placeholder = min(width * L["qr_size"], height * L["qr_size"])
     qr_y = height * L["qr_y"]
+    wifi_qr_x = (width - placeholder) / 2
 
-    if is_landscape:
-        # QR codes positioned symmetrically around center
-        half_spacing = width * L["qr_spacing"] / 2
-        wifi_qr_x = width / 2 - half_spacing - (app_qr_size * qr_scale) / 2
-        app_qr_x = width / 2 + half_spacing - (app_qr_size * qr_scale) / 2
-    else:
-        # QR codes with explicit gap between them
-        gap = width * L["qr_spacing"]
-        total_qr_width = 2 * app_qr_size * qr_scale + gap
-        wifi_qr_x = (width - total_qr_width) / 2
-        app_qr_x = wifi_qr_x + app_qr_size * qr_scale + gap
-
-    label_y = qr_y + app_qr_size * qr_scale + height * (0.06 if is_landscape else 0.03)
+    label_y = qr_y + placeholder + height * (0.06 if is_landscape else 0.03)
     label_size = max(12, height * (0.030 if is_landscape else 0.018))
     title_y = icon_y + icon_scale * 0.55
     title_size = max(18, height * L["title_size"])
     subtitle_size = max(10, height * L["subtitle_size"])
 
     # WiFi QR placeholder dimensions
-    wifi_placeholder_size = int(app_qr_size * qr_scale)
+    wifi_placeholder_size = int(placeholder)
     wifi_placeholder_x = int(wifi_qr_x)
     wifi_placeholder_y = int(qr_y)
 
@@ -171,41 +159,45 @@ def generate_splash_svg(width: int, height: int) -> tuple:
         rx="4" fill="white"/>
   <text x="{wifi_placeholder_x + wifi_placeholder_size / 2}" y="{label_y}"
         text-anchor="middle" font-family="sans-serif" font-size="{label_size}"
-        fill="#f0e4d0" fill-opacity="0.8">Scan to connect WiFi</text>
-
-  <!-- App download QR code -->
-  <rect x="{int(app_qr_x) - 4}" y="{int(qr_y) - 4}"
-        width="{wifi_placeholder_size + 8}" height="{wifi_placeholder_size + 8}"
-        rx="4" fill="white"/>
-  <g transform="translate({int(app_qr_x)}, {int(qr_y)}) scale({qr_scale})">
-    <path d="{app_qr_path}" fill="black"/>
-  </g>
-  <text x="{int(app_qr_x) + wifi_placeholder_size / 2}" y="{label_y}"
-        text-anchor="middle" font-family="sans-serif" font-size="{label_size}"
-        fill="#f0e4d0" fill-opacity="0.8">Scan to download app</text>
+        fill="#f0e4d0" fill-opacity="0.8">Scan to connect this frame to WiFi</text>
 
 </svg>"""
     return svg, wifi_placeholder_x, wifi_placeholder_y, wifi_placeholder_size
 
 
 def svg_to_png(svg_path: str, png_path: str, width: int, height: int) -> bool:
-    """Convert SVG to PNG using rsvg-convert."""
+    """Convert SVG to PNG.
+
+    rsvg-convert is preferred; cairosvg is used when it is absent, so the splash
+    can be regenerated on a machine without librsvg rather than being a build
+    dependency nobody can satisfy.
+    """
     rsvg = shutil.which("rsvg-convert")
-    if not rsvg:
-        print("ERROR: rsvg-convert not found.")
-        print("  Ubuntu: sudo apt-get install librsvg2-bin")
-        print("  macOS:  brew install librsvg")
+    if rsvg:
+        try:
+            subprocess.run(
+                [rsvg, "-w", str(width), "-h", str(height), svg_path, "-o", png_path],
+                check=True,
+                capture_output=True,
+            )
+            return True
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: rsvg-convert failed: {e.stderr.decode()}")
+            return False
+
+    try:
+        import cairosvg
+    except ImportError:
+        print("ERROR: need either rsvg-convert (librsvg2-bin) or cairosvg.")
+        print("  pip install cairosvg   -- or --   sudo apt-get install librsvg2-bin")
         return False
 
     try:
-        subprocess.run(
-            [rsvg, "-w", str(width), "-h", str(height), svg_path, "-o", png_path],
-            check=True,
-            capture_output=True,
-        )
+        cairosvg.svg2png(url=svg_path, write_to=png_path, output_width=width,
+                         output_height=height)
         return True
-    except subprocess.CalledProcessError as e:
-        print(f"ERROR: rsvg-convert failed: {e.stderr.decode()}")
+    except Exception as e:  # noqa: BLE001 - report and fail the build step
+        print(f"ERROR: cairosvg failed: {e}")
         return False
 
 
@@ -316,7 +308,7 @@ def generate_setup_complete_svg(width: int, height: int) -> tuple:
         fill="#f0e4d0">Setup Complete!</text>
   <text x="{width / 2}" y="{title_y + title_size * 1.5 + subtitle_size * 1.8}" text-anchor="middle"
         font-family="sans-serif" font-size="{subtitle_size}"
-        fill="#f0e4d0" fill-opacity="0.6">Scan the QR code or use the app to get started</text>
+        fill="#f0e4d0" fill-opacity="0.6">Scan the QR code to open the frame's web interface</text>
 
   <!-- QR code placeholder (white background, firmware fills at runtime) -->
   <rect x="{qr_x - 4}" y="{qr_y_pos - 4}"

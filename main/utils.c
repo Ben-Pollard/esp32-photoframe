@@ -2,10 +2,12 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "ai_gen.h"
 #include "board_hal.h"
 #include "cJSON.h"
 #include "cert_pin.h"
@@ -438,12 +440,21 @@ esp_err_t apply_config_from_json(cJSON *root, bool from_remote)
     item = cJSON_GetObjectItem(root, "rotation_mode");
     if (item && cJSON_IsString(item)) {
         const char *mode_str = cJSON_GetStringValue(item);
-        rotation_mode_t mode = ROTATION_MODE_STORAGE;
-        if (strcmp(mode_str, "url") == 0)
+        rotation_mode_t mode;
+        if (strcmp(mode_str, "url") == 0) {
             mode = ROTATION_MODE_URL;
-        // Backwards compatibility: accept "sdcard" as alias for "storage"
-        if (strcmp(mode_str, "sdcard") == 0)
+        } else if (strcmp(mode_str, "ai") == 0) {
+            mode = ROTATION_MODE_AI;
+        } else if (strcmp(mode_str, "storage") == 0 || strcmp(mode_str, "sdcard") == 0) {
+            // Backwards compatibility: "sdcard" is the legacy alias for "storage"
             mode = ROTATION_MODE_STORAGE;
+        } else {
+            // An unrecognised string used to become "storage" in silence, which
+            // hides a typo behind a mode nobody asked for. The fallback stays so
+            // no existing client breaks, but it is now visible.
+            ESP_LOGW(TAG, "Unknown rotation_mode \"%s\", falling back to storage", mode_str);
+            mode = ROTATION_MODE_STORAGE;
+        }
         config_manager_set_rotation_mode(mode);
     }
 
@@ -540,15 +551,187 @@ esp_err_t apply_config_from_json(cJSON *root, bool from_remote)
         config_manager_set_ha_url(cJSON_GetStringValue(item));
     }
 
-    // AI API Keys
-    item = cJSON_GetObjectItem(root, "openai_api_key");
+    // The frame's own key. Rejected rather than truncated for the same reason as
+    // the model name: a silently shortened key fails every generation and the UI
+    // can no longer show what was configured.
+    item = cJSON_GetObjectItem(root, "ai_api_key");
     if (item && cJSON_IsString(item)) {
-        config_manager_set_openai_api_key(cJSON_GetStringValue(item));
+        const char *k = cJSON_GetStringValue(item);
+        if (strlen(k) >= AI_API_KEY_MAX_LEN) {
+            utils_set_config_error("ai_api_key is too long");
+            had_error = true;
+        } else {
+            config_manager_set_ai_api_key(k);
+        }
     }
 
-    item = cJSON_GetObjectItem(root, "google_api_key");
+    item = cJSON_GetObjectItem(root, "ai_writer_url");
     if (item && cJSON_IsString(item)) {
-        config_manager_set_google_api_key(cJSON_GetStringValue(item));
+        const char *u = cJSON_GetStringValue(item);
+        if (strlen(u) >= AI_WRITER_URL_MAX_LEN) {
+            utils_set_config_error("ai_writer_url is too long");
+            had_error = true;
+        } else {
+            config_manager_set_ai_writer_url(u);
+        }
+    }
+
+    item = cJSON_GetObjectItem(root, "ai_writer_model");
+    if (item && cJSON_IsString(item)) {
+        const char *m = cJSON_GetStringValue(item);
+        if (strlen(m) >= AI_WRITER_MODEL_MAX_LEN) {
+            utils_set_config_error("ai_writer_model is too long");
+            had_error = true;
+        } else {
+            config_manager_set_ai_writer_model(m);
+        }
+    }
+
+    item = cJSON_GetObjectItem(root, "ai_prompt_template");
+    if (item && cJSON_IsString(item)) {
+        const char *t = cJSON_GetStringValue(item);
+        if (t[0] == '\0') {
+            // Empty means "go back to the built-in template", not "save nothing".
+            config_manager_clear_ai_template();
+        } else if (strlen(t) >= AI_TEMPLATE_MAX_LEN) {
+            utils_set_config_error("ai_prompt_template is too long");
+            had_error = true;
+        } else if (strstr(t, "{{weather}}") == NULL) {
+            // Refuse at save time: a template without the weather slot would
+            // silently produce a prompt with no weather in it, every day.
+            utils_set_config_error("ai_prompt_template must contain {{weather}}");
+            had_error = true;
+        } else {
+            esp_err_t terr = config_manager_set_ai_template(t);
+            if (terr != ESP_OK) {
+                utils_set_config_error("ai_prompt_template could not be saved");
+                had_error = true;
+            }
+        }
+    }
+
+    item = cJSON_GetObjectItem(root, "ai_place");
+    if (item && cJSON_IsString(item)) {
+        const char *pl = cJSON_GetStringValue(item);
+        if (strlen(pl) >= AI_PLACE_MAX_LEN) {
+            utils_set_config_error("ai_place is too long");
+            had_error = true;
+        } else {
+            config_manager_set_ai_place(pl);
+        }
+    }
+
+    // Weather location. Checked before persisting: a bad value would point the
+    // weather fetch somewhere the frame is not, which is worse than keeping the
+    // previous position. NaN is rejected too, since it fails both comparisons.
+    item = cJSON_GetObjectItem(root, "weather_latitude");
+    if (item && cJSON_IsNumber(item)) {
+        double v = item->valuedouble;
+        if (v >= WEATHER_LATITUDE_MIN && v <= WEATHER_LATITUDE_MAX) {
+            config_manager_set_weather_latitude(v);
+        } else {
+            utils_set_config_error("weather_latitude must be between -90 and 90");
+            had_error = true;
+        }
+    }
+
+    item = cJSON_GetObjectItem(root, "weather_longitude");
+    if (item && cJSON_IsNumber(item)) {
+        double v = item->valuedouble;
+        if (v >= WEATHER_LONGITUDE_MIN && v <= WEATHER_LONGITUDE_MAX) {
+            config_manager_set_weather_longitude(v);
+        } else {
+            utils_set_config_error("weather_longitude must be between -180 and 180");
+            had_error = true;
+        }
+    }
+
+    // Generation endpoint. Required to be https: the API key is sent to this
+    // address as a bearer token, so a plain-http endpoint would leak it in the
+    // clear on every generation.
+    item = cJSON_GetObjectItem(root, "ai_url");
+    if (item && cJSON_IsString(item)) {
+        const char *url = cJSON_GetStringValue(item);
+        if (strncmp(url, "https://", 8) != 0) {
+            utils_set_config_error("ai_url must start with https:// (the API key is sent to it)");
+            had_error = true;
+        } else if (strlen(url) >= AI_URL_MAX_LEN) {
+            utils_set_config_error("ai_url is too long");
+            had_error = true;
+        } else {
+            config_manager_set_ai_url(url);
+        }
+    }
+
+    // The ordered list. Either form is accepted: an array (reorder) or a single
+    // model id (choose it, which means moving it to the head).
+    item = cJSON_GetObjectItem(root, "ai_model_order");
+    if (item && cJSON_IsArray(item)) {
+        char csv[AI_MODEL_ORDER_MAX_LEN];
+        size_t n = 0;
+        csv[0] = '\0';
+        int count = 0;
+        const cJSON *entry = NULL;
+        cJSON_ArrayForEach(entry, item) {
+            if (!cJSON_IsString(entry)) {
+                utils_set_config_error("ai_model_order must contain only strings");
+                had_error = true;
+                n = 0;
+                break;
+            }
+            const char *id = cJSON_GetStringValue(entry);
+            if (strlen(id) >= AI_MODEL_MAX_LEN || strchr(id, ',')) {
+                utils_set_config_error("ai_model_order has an invalid entry");
+                had_error = true;
+                n = 0;
+                break;
+            }
+            if (++count > AI_MODEL_ORDER_MAX_ENTRIES) {
+                utils_set_config_error("ai_model_order has too many entries");
+                had_error = true;
+                n = 0;
+                break;
+            }
+            n += (size_t) snprintf(csv + n, sizeof(csv) - n, "%s%s", n ? "," : "", id);
+            if (n >= sizeof(csv) - 1) {
+                utils_set_config_error("ai_model_order is too long");
+                had_error = true;
+                n = 0;
+                break;
+            }
+        }
+        if (n > 0) {
+            if (config_manager_set_ai_model_order(csv) != ESP_OK) {
+                utils_set_config_error("ai_model_order could not be saved");
+                had_error = true;
+            }
+        }
+    }
+
+    item = cJSON_GetObjectItem(root, "ai_image_model");
+    if (item && cJSON_IsString(item)) {
+        const char *model = cJSON_GetStringValue(item);
+        // Reject rather than truncate: a chopped model name is accepted, stored,
+        // echoed back by GET as if it were what was sent, and then fails every
+        // generation with an opaque "model not found" -- and the UI can no
+        // longer show what was actually configured.
+        if (strlen(model) >= AI_MODEL_MAX_LEN) {
+            utils_set_config_error("ai_image_model is too long");
+            had_error = true;
+        } else {
+            config_manager_set_ai_image_model(model);
+        }
+    }
+
+    item = cJSON_GetObjectItem(root, "ai_direction");
+    if (item && cJSON_IsString(item)) {
+        const char *dir = cJSON_GetStringValue(item);
+        if (strlen(dir) >= AI_DIRECTION_MAX_LEN) {
+            utils_set_config_error("ai_direction is too long");
+            had_error = true;
+        } else {
+            config_manager_set_ai_direction(dir);
+        }
     }
 
     // Power
@@ -1557,6 +1740,41 @@ esp_err_t trigger_image_rotation(void)
             // hint why (#121). The error is reported via last_fetch_error.
             ESP_LOGE(TAG, "Failed to fetch image from URL; keeping the current picture");
             result = ESP_FAIL;
+        }
+    } else if (rotation_mode == ROTATION_MODE_AI) {
+        // Generate today's picture from the weather here.
+        //
+        // The pipeline is asynchronous for HTTP callers, but a rotation tick has
+        // to be synchronous: the deep-sleep path enters sleep as soon as this
+        // function returns, so returning early would put the device to bed with
+        // the picture still in flight. URL mode blocks for the same reason.
+        // Blocking is the contract this function has, not an oversight.
+        ESP_LOGI(TAG, "AI rotation mode - generating today's picture");
+        esp_err_t started = ai_gen_start(NULL);
+        if (started != ESP_OK) {
+            ESP_LOGE(TAG, "Could not start daily generation: %s", esp_err_to_name(started));
+            result = ESP_FAIL;
+        } else {
+            int64_t deadline_us = esp_timer_get_time() + (int64_t)AI_ROTATION_TIMEOUT_MS * 1000;
+            while (ai_gen_is_busy() && esp_timer_get_time() < deadline_us) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+
+            ai_gen_status_t st;
+            ai_gen_get_status(&st);
+            if (st.state == AI_STATE_SUCCESS) {
+                ESP_LOGI(TAG, "Daily generation complete in %" PRId64 " ms", st.elapsed_ms);
+            } else if (ai_gen_is_busy()) {
+                // Timed out with the worker still running. The ceiling exists so a
+                // wedged socket cannot hold the device awake indefinitely; the
+                // worker is left alone and dies with the next sleep.
+                ESP_LOGE(TAG, "Daily generation timed out after %d ms", AI_ROTATION_TIMEOUT_MS);
+                result = ESP_ERR_TIMEOUT;
+            } else {
+                ESP_LOGE(TAG, "Daily generation failed while %s: %s",
+                        ai_gen_state_name(st.state), st.error[0] ? st.error : "no detail");
+                result = ESP_FAIL;
+            }
         }
     } else {
         // Local storage mode - rotate through albums

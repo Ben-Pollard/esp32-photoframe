@@ -77,3 +77,12 @@ CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
 
 # mbedTLS - Keep peer certificate for trust-cert endpoint
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=y
+
+# mbedTLS - Accept cross-signed roots in the CA bundle.
+# openrouter.ai chains leaf -> GTS WE1 -> GTS Root R4 cross-signed by the old
+# "GlobalSign Root CA" (R1), which the FULL bundle does not carry (it has
+# GlobalSign R3/R6 only). Without this, verification stops with
+# "No matching trusted root certificate found" / -0x3000, because mbedTLS will
+# not substitute the bundle's self-signed GTS Root R4 for the cross-signed one
+# the server sends. Costs ~700 B of heap.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y

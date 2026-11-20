@@ -7,6 +7,12 @@ if(NOT PYTHON)
     set(PYTHON python3)
 endif()
 
+# The version is read from git at configure time, so without this CMake only
+# re-evaluates it when a CMakeLists changes -- and a plain `idf.py build` after a
+# commit leaves the firmware reporting a stale version, which is exactly what a
+# bug report would quote. Reconfigure whenever HEAD moves.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/.git/HEAD")
+
 # Get version from centralized script
 execute_process(
     COMMAND ${PYTHON} ${CMAKE_SOURCE_DIR}/scripts/get_version.py --type auto

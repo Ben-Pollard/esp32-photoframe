@@ -31,6 +31,15 @@ static char static_netmask[IP_ADDR_STR_MAX_LEN] = {0};
 static char static_gateway[IP_ADDR_STR_MAX_LEN] = {0};
 static char dns_server[IP_ADDR_STR_MAX_LEN] = {0};
 
+// Generation settings: the weather service's location, the endpoint/model pair,
+// and the owner's standing creative instructions, which the UI edits by hand.
+static double weather_latitude = DEFAULT_WEATHER_LATITUDE;
+static double weather_longitude = DEFAULT_WEATHER_LONGITUDE;
+static char ai_url[AI_URL_MAX_LEN] = {0};
+static char ai_image_model[AI_MODEL_MAX_LEN] = {0};
+static int ai_model_fails = 0;
+static char ai_direction[AI_DIRECTION_MAX_LEN] = {0};
+
 // Auto Rotate
 static bool auto_rotate_enabled = false;
 static char cron_rules_store[MAX_CRON_RULES][CRON_RULE_MAX_LEN] = {{0}};
@@ -63,8 +72,14 @@ static char image_etag[HTTP_ETAG_MAX_LEN] = {0};
 static char ha_url[HA_URL_MAX_LEN] = {0};
 
 // AI API Keys
-static char openai_api_key[AI_API_KEY_MAX_LEN] = {0};
-static char google_api_key[AI_API_KEY_MAX_LEN] = {0};
+static char ai_api_key[AI_API_KEY_MAX_LEN] = {0};
+static char ai_writer_url[AI_WRITER_URL_MAX_LEN] = {0};
+static char ai_writer_model[AI_WRITER_MODEL_MAX_LEN] = {0};
+static char ai_place[AI_PLACE_MAX_LEN] = {0};
+static char ai_template[AI_TEMPLATE_MAX_LEN] = {0};
+static size_t ai_template_len = 0;  // 0 = no saved template, use the default
+static char ai_model_order[AI_MODEL_ORDER_MAX_LEN] = {0};
+static int ai_fail_streak = 0;
 
 // Power
 static bool deep_sleep_enabled = true;     // Enabled by default
@@ -299,7 +314,7 @@ esp_err_t config_manager_init(void)
         if (nvs_get_u8(nvs_handle, NVS_ROTATION_MODE_KEY, &stored_mode) == ESP_OK) {
             rotation_mode = (rotation_mode_t) stored_mode;
             ESP_LOGI(TAG, "Loaded rotation mode from NVS: %s",
-                     rotation_mode == ROTATION_MODE_URL ? "url" : "storage");
+                     config_manager_rotation_mode_str(rotation_mode));
         } else if (storage_has_persistent_storage()) {
             rotation_mode = ROTATION_MODE_STORAGE;
             ESP_LOGI(TAG, "No rotation mode in NVS, using default for persistent storage: storage");
@@ -386,18 +401,103 @@ esp_err_t config_manager_init(void)
             ESP_LOGI(TAG, "No HA URL in NVS, using default (empty)");
         }
 
-        // AI API Keys
-        size_t openai_key_len = AI_API_KEY_MAX_LEN;
-        if (nvs_get_str(nvs_handle, NVS_OPENAI_API_KEY_KEY, openai_api_key, &openai_key_len) ==
-            ESP_OK) {
-            ESP_LOGI(TAG, "Loaded OpenAI API Key from NVS");
+        // The frame's own key. When unset, adopt the legacy openai_key so an
+        // already-provisioned frame keeps generating after this rename, then
+        // persist it so the migration happens once.
+        size_t ai_key_len = AI_API_KEY_MAX_LEN;
+        if (nvs_get_str(nvs_handle, NVS_AI_API_KEY_KEY, ai_api_key, &ai_key_len) != ESP_OK ||
+            ai_api_key[0] == '\0') {
+            char legacy[AI_API_KEY_MAX_LEN] = {0};
+            size_t legacy_len = sizeof(legacy);
+            if (nvs_get_str(nvs_handle, "openai_key", legacy, &legacy_len) == ESP_OK &&
+                legacy[0] != '\0') {
+                snprintf(ai_api_key, sizeof(ai_api_key), "%s", legacy);
+                nvs_handle_t w;
+                if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &w) == ESP_OK) {
+                    nvs_set_str(w, NVS_AI_API_KEY_KEY, ai_api_key);
+                    nvs_commit(w);
+                    nvs_close(w);
+                }
+                ESP_LOGI(TAG, "Migrated openai_key to the frame's AI key");
+            }
         }
 
-        size_t google_key_len = AI_API_KEY_MAX_LEN;
-        if (nvs_get_str(nvs_handle, NVS_GOOGLE_API_KEY_KEY, google_api_key, &google_key_len) ==
-            ESP_OK) {
-            ESP_LOGI(TAG, "Loaded Google API Key from NVS");
+        size_t wurl_len = AI_WRITER_URL_MAX_LEN;
+        if (nvs_get_str(nvs_handle, NVS_AI_WRITER_URL_KEY, ai_writer_url, &wurl_len) != ESP_OK ||
+            ai_writer_url[0] == '\0') {
+            snprintf(ai_writer_url, sizeof(ai_writer_url), "%s", DEFAULT_AI_WRITER_URL);
         }
+        size_t wmodel_len = AI_WRITER_MODEL_MAX_LEN;
+        if (nvs_get_str(nvs_handle, NVS_AI_WRITER_MODEL_KEY, ai_writer_model, &wmodel_len) != ESP_OK ||
+            ai_writer_model[0] == '\0') {
+            snprintf(ai_writer_model, sizeof(ai_writer_model), "%s", DEFAULT_AI_WRITER_MODEL);
+        }
+        size_t place_len = AI_PLACE_MAX_LEN;
+        if (nvs_get_str(nvs_handle, NVS_AI_PLACE_KEY, ai_place, &place_len) != ESP_OK) {
+            ai_place[0] = '\0';
+        }
+
+        size_t order_len = sizeof(ai_model_order);
+        if (nvs_get_blob(nvs_handle, NVS_AI_MODEL_ORDER_KEY, ai_model_order, &order_len) != ESP_OK ||
+            ai_model_order[0] == '\0') {
+            snprintf(ai_model_order, sizeof(ai_model_order), "%s", DEFAULT_AI_MODEL_ORDER);
+        }
+
+        int32_t streak = 0;
+        if (nvs_get_i32(nvs_handle, NVS_AI_FAIL_STREAK_KEY, &streak) == ESP_OK) {
+            ai_fail_streak = streak < 0 ? 0 : (int)streak;
+        }
+
+        size_t tmpl_len = sizeof(ai_template);
+        if (nvs_get_blob(nvs_handle, NVS_AI_TEMPLATE_KEY, ai_template, &tmpl_len) == ESP_OK &&
+            tmpl_len > 1) {
+            ai_template_len = tmpl_len;
+            ESP_LOGI(TAG, "Loaded prompt template from NVS (%u bytes)", (unsigned)tmpl_len);
+        } else {
+            ai_template_len = 0;
+        }
+
+        // Weather location. Out-of-range or absent coordinates fall back to the
+        // compiled default rather than being clamped: a half-correct position
+        // would produce a forecast for somewhere the frame is not, which is worse
+        // than an honest default.
+        double wx_lat_val = DEFAULT_WEATHER_LATITUDE;
+        if (nvs_get_double(nvs_handle, NVS_WEATHER_LATITUDE_KEY, &wx_lat_val) == ESP_OK &&
+            wx_lat_val >= WEATHER_LATITUDE_MIN && wx_lat_val <= WEATHER_LATITUDE_MAX) {
+            weather_latitude = wx_lat_val;
+        }
+        double wx_lon_val = DEFAULT_WEATHER_LONGITUDE;
+        if (nvs_get_double(nvs_handle, NVS_WEATHER_LONGITUDE_KEY, &wx_lon_val) == ESP_OK &&
+            wx_lon_val >= WEATHER_LONGITUDE_MIN && wx_lon_val <= WEATHER_LONGITUDE_MAX) {
+            weather_longitude = wx_lon_val;
+        }
+
+        // Generation endpoint and model. An unset or blank value means "use the
+        // compiled default", so a fresh device works without any configuration.
+        // A stored non-https endpoint is discarded rather than honoured: the API
+        // key travels to whatever this says, so the scheme is not a preference.
+        size_t ai_url_len = AI_URL_MAX_LEN;
+        if (nvs_get_str(nvs_handle, NVS_AI_URL_KEY, ai_url, &ai_url_len) != ESP_OK ||
+            ai_url[0] == '\0' || strncmp(ai_url, "https://", 8) != 0) {
+            snprintf(ai_url, sizeof(ai_url), "%s", DEFAULT_AI_URL);
+        }
+        size_t ai_model_len = AI_MODEL_MAX_LEN;
+        if (nvs_get_str(nvs_handle, NVS_AI_IMAGE_MODEL_KEY, ai_image_model, &ai_model_len) != ESP_OK ||
+            ai_image_model[0] == '\0') {
+            snprintf(ai_image_model, sizeof(ai_image_model), "%s", DEFAULT_AI_IMAGE_MODEL);
+        }
+
+        int32_t stored_ai_fails = 0;
+        if (nvs_get_i32(nvs_handle, NVS_AI_MODEL_FAILS_KEY, &stored_ai_fails) == ESP_OK) {
+            ai_model_fails = stored_ai_fails < 0 ? 0 : (int)stored_ai_fails;
+        }
+
+        size_t ai_dir_len = AI_DIRECTION_MAX_LEN;
+        if (nvs_get_str(nvs_handle, NVS_AI_DIRECTION_KEY, ai_direction, &ai_dir_len) == ESP_OK) {
+            ESP_LOGI(TAG, "Loaded AI direction (%u chars)", (unsigned)strlen(ai_direction));
+        }
+        ESP_LOGI(TAG, "Weather location: %.4f, %.4f", weather_latitude, weather_longitude);
+        ESP_LOGI(TAG, "Generation endpoint: %s (%s)", ai_url, ai_image_model);
 
         // Power
         uint8_t deep_sleep_val = 1;  // Default to enabled
@@ -827,6 +927,22 @@ int config_manager_get_compiled_cron_rules(cron_rule_t *out, int max)
     return n;
 }
 
+// Canonical name for a rotation mode. Public so the API serialisation and the
+// logs cannot drift apart: a mode missing from this table shows up as "unknown"
+// rather than being silently reported as some other mode.
+const char *config_manager_rotation_mode_str(rotation_mode_t mode)
+{
+    switch (mode) {
+    case ROTATION_MODE_STORAGE:
+        return "storage";
+    case ROTATION_MODE_URL:
+        return "url";
+    case ROTATION_MODE_AI:
+        return "ai";
+    }
+    return "unknown";
+}
+
 void config_manager_set_rotation_mode(rotation_mode_t mode)
 {
     if (!storage_has_persistent_storage() && mode == ROTATION_MODE_STORAGE) {
@@ -843,7 +959,7 @@ void config_manager_set_rotation_mode(rotation_mode_t mode)
         nvs_close(nvs_handle);
     }
 
-    ESP_LOGI(TAG, "Rotation mode set to: %s", mode == ROTATION_MODE_URL ? "url" : "sdcard");
+    ESP_LOGI(TAG, "Rotation mode set to: %s", config_manager_rotation_mode_str(mode));
 }
 
 rotation_mode_t config_manager_get_rotation_mode(void)
@@ -1188,52 +1304,355 @@ const char *config_manager_get_ha_url(void)
 // AI Generation
 // ============================================================================
 
-void config_manager_set_openai_api_key(const char *key)
+const char *config_manager_get_ai_api_key(void)
+{
+    return ai_api_key;
+}
+
+void config_manager_set_ai_api_key(const char *key)
 {
     if (key == NULL) {
         return;
     }
-
-    strncpy(openai_api_key, key, AI_API_KEY_MAX_LEN - 1);
-    openai_api_key[AI_API_KEY_MAX_LEN - 1] = '\0';
+    strncpy(ai_api_key, key, AI_API_KEY_MAX_LEN - 1);
+    ai_api_key[AI_API_KEY_MAX_LEN - 1] = '\0';
 
     nvs_handle_t nvs_handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
-        nvs_set_str(nvs_handle, NVS_OPENAI_API_KEY_KEY, openai_api_key);
+        nvs_set_str(nvs_handle, NVS_AI_API_KEY_KEY, ai_api_key);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+    // Never log the value.
+    ESP_LOGI(TAG, "Frame AI key %s", ai_api_key[0] ? "set" : "cleared");
+}
+
+const char *config_manager_get_ai_writer_url(void)
+{
+    return ai_writer_url[0] ? ai_writer_url : DEFAULT_AI_WRITER_URL;
+}
+
+void config_manager_set_ai_writer_url(const char *url)
+{
+    if (url == NULL) {
+        return;
+    }
+    strncpy(ai_writer_url, url, sizeof(ai_writer_url) - 1);
+    ai_writer_url[sizeof(ai_writer_url) - 1] = '\0';
+    if (ai_writer_url[0] == '\0') {
+        snprintf(ai_writer_url, sizeof(ai_writer_url), "%s", DEFAULT_AI_WRITER_URL);
+    }
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_str(nvs_handle, NVS_AI_WRITER_URL_KEY, ai_writer_url);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+    ESP_LOGI(TAG, "Prompt writer endpoint set to %s", ai_writer_url);
+}
+
+const char *config_manager_get_ai_writer_model(void)
+{
+    return ai_writer_model[0] ? ai_writer_model : DEFAULT_AI_WRITER_MODEL;
+}
+
+void config_manager_set_ai_writer_model(const char *model)
+{
+    if (model == NULL) {
+        return;
+    }
+    strncpy(ai_writer_model, model, sizeof(ai_writer_model) - 1);
+    ai_writer_model[sizeof(ai_writer_model) - 1] = '\0';
+    if (ai_writer_model[0] == '\0') {
+        snprintf(ai_writer_model, sizeof(ai_writer_model), "%s", DEFAULT_AI_WRITER_MODEL);
+    }
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_str(nvs_handle, NVS_AI_WRITER_MODEL_KEY, ai_writer_model);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+    ESP_LOGI(TAG, "Prompt writer model set to %s", ai_writer_model);
+}
+
+const char *config_manager_get_ai_place(void)
+{
+    // The compiled template uses {{place}}, so an unset value would make every
+    // prompt fail to compose. Fall back rather than refuse.
+    return ai_place[0] ? ai_place : DEFAULT_AI_PLACE;
+}
+
+const char *config_manager_get_ai_model_order(void)
+{
+    return ai_model_order[0] ? ai_model_order : DEFAULT_AI_MODEL_ORDER;
+}
+
+esp_err_t config_manager_set_ai_model_order(const char *csv)
+{
+    if (!csv || csv[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strlen(csv) >= sizeof(ai_model_order)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    snprintf(ai_model_order, sizeof(ai_model_order), "%s", csv);
+
+    // The head of the order is the model in use; keeping ai_image_model in step
+    // means every existing reader of it (status, logs) still sees the truth.
+    char head[AI_MODEL_MAX_LEN];
+    size_t i = 0;
+    while (csv[i] && csv[i] != ',' && i < sizeof(head) - 1) {
+        head[i] = csv[i];
+        i++;
+    }
+    head[i] = '\0';
+    if (head[0]) {
+        config_manager_set_ai_image_model(head);
+    }
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    esp_err_t err = nvs_set_blob(nvs_handle, NVS_AI_MODEL_ORDER_KEY, ai_model_order,
+                                 strlen(ai_model_order) + 1);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+    }
+    nvs_close(nvs_handle);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Model order set to %s", ai_model_order);
+    }
+    return err;
+}
+
+int config_manager_get_ai_fail_streak(void)
+{
+    return ai_fail_streak;
+}
+
+void config_manager_set_ai_fail_streak(int days)
+{
+    ai_fail_streak = days < 0 ? 0 : days;
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_i32(nvs_handle, NVS_AI_FAIL_STREAK_KEY, ai_fail_streak);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+}
+
+const char *config_manager_get_ai_template(void)
+{
+    return ai_template_len > 1 ? ai_template : NULL;
+}
+
+esp_err_t config_manager_set_ai_template(const char *tmpl)
+{
+    if (!tmpl || tmpl[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t len = strlen(tmpl) + 1;  // include the terminator
+    if (len > sizeof(ai_template)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    memcpy(ai_template, tmpl, len);
+    ai_template_len = len;
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    esp_err_t err = nvs_set_blob(nvs_handle, NVS_AI_TEMPLATE_KEY, ai_template, len);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+    }
+    nvs_close(nvs_handle);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "Prompt template saved (%u bytes)", (unsigned)len);
+    }
+    return err;
+}
+
+void config_manager_clear_ai_template(void)
+{
+    ai_template[0] = '\0';
+    ai_template_len = 0;
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_erase_key(nvs_handle, NVS_AI_TEMPLATE_KEY);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+    ESP_LOGI(TAG, "Prompt template reset to the built-in default");
+}
+
+void config_manager_set_ai_place(const char *place)
+{
+    if (place == NULL) {
+        return;
+    }
+    strncpy(ai_place, place, sizeof(ai_place) - 1);
+    ai_place[sizeof(ai_place) - 1] = '\0';
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_str(nvs_handle, NVS_AI_PLACE_KEY, ai_place);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+    ESP_LOGI(TAG, "Place set to \"%s\"", ai_place);
+}
+
+void config_manager_set_weather_latitude(double value)
+{
+    weather_latitude = value;
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_double(nvs_handle, NVS_WEATHER_LATITUDE_KEY, value);
         nvs_commit(nvs_handle);
         nvs_close(nvs_handle);
     }
 
-    ESP_LOGI(TAG, "OpenAI API Key set");
+    ESP_LOGI(TAG, "Weather latitude set to %.4f", weather_latitude);
 }
 
-const char *config_manager_get_openai_api_key(void)
+double config_manager_get_weather_latitude(void)
 {
-    return openai_api_key;
+    return weather_latitude;
 }
 
-void config_manager_set_google_api_key(const char *key)
+void config_manager_set_weather_longitude(double value)
 {
-    if (key == NULL) {
+    weather_longitude = value;
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_double(nvs_handle, NVS_WEATHER_LONGITUDE_KEY, value);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+
+    ESP_LOGI(TAG, "Weather longitude set to %.4f", weather_longitude);
+}
+
+double config_manager_get_weather_longitude(void)
+{
+    return weather_longitude;
+}
+
+void config_manager_set_ai_url(const char *url)
+{
+    if (url == NULL) {
         return;
     }
 
-    strncpy(google_api_key, key, AI_API_KEY_MAX_LEN - 1);
-    google_api_key[AI_API_KEY_MAX_LEN - 1] = '\0';
+    // The https requirement is enforced here as well as at the JSON boundary:
+    // this is the chokepoint every write goes through, and an http endpoint would
+    // ship the key as a cleartext bearer token on every generation. An
+    // empty value is not a scheme violation but a request for the default.
+    if (url[0] != '\0' && strncmp(url, "https://", 8) != 0) {
+        ESP_LOGW(TAG, "Refusing non-https generation endpoint: %s", url);
+        return;
+    }
+
+    strncpy(ai_url, url, AI_URL_MAX_LEN - 1);
+    ai_url[AI_URL_MAX_LEN - 1] = '\0';
+    if (ai_url[0] == '\0') {
+        snprintf(ai_url, sizeof(ai_url), "%s", DEFAULT_AI_URL);
+    }
 
     nvs_handle_t nvs_handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
-        nvs_set_str(nvs_handle, NVS_GOOGLE_API_KEY_KEY, google_api_key);
+        nvs_set_str(nvs_handle, NVS_AI_URL_KEY, ai_url);
         nvs_commit(nvs_handle);
         nvs_close(nvs_handle);
     }
 
-    ESP_LOGI(TAG, "Google API Key set");
+    ESP_LOGI(TAG, "Generation endpoint set to %s", ai_url);
 }
 
-const char *config_manager_get_google_api_key(void)
+const char *config_manager_get_ai_url(void)
 {
-    return google_api_key;
+    if (ai_url[0] == '\0') {
+        return DEFAULT_AI_URL;
+    }
+    return ai_url;
+}
+
+void config_manager_set_ai_image_model(const char *model)
+{
+    if (model == NULL) {
+        return;
+    }
+
+    strncpy(ai_image_model, model, AI_MODEL_MAX_LEN - 1);
+    ai_image_model[AI_MODEL_MAX_LEN - 1] = '\0';
+    if (ai_image_model[0] == '\0') {
+        snprintf(ai_image_model, sizeof(ai_image_model), "%s", DEFAULT_AI_IMAGE_MODEL);
+    }
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_str(nvs_handle, NVS_AI_IMAGE_MODEL_KEY, ai_image_model);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+
+    ESP_LOGI(TAG, "Image model set to %s", ai_image_model);
+}
+
+const char *config_manager_get_ai_image_model(void)
+{
+    if (ai_image_model[0] == '\0') {
+        return DEFAULT_AI_IMAGE_MODEL;
+    }
+    return ai_image_model;
+}
+
+int config_manager_get_ai_model_fails(void)
+{
+    return ai_model_fails;
+}
+
+void config_manager_set_ai_model_fails(int fails)
+{
+    if (fails < 0) {
+        fails = 0;
+    }
+    ai_model_fails = fails;
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_i32(nvs_handle, NVS_AI_MODEL_FAILS_KEY, (int32_t)ai_model_fails);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+}
+
+void config_manager_set_ai_direction(const char *direction)
+{
+    if (direction == NULL) {
+        return;
+    }
+
+    strncpy(ai_direction, direction, AI_DIRECTION_MAX_LEN - 1);
+    ai_direction[AI_DIRECTION_MAX_LEN - 1] = '\0';
+
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_set_str(nvs_handle, NVS_AI_DIRECTION_KEY, ai_direction);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+
+    ESP_LOGI(TAG, "AI direction set (%u chars)", (unsigned)strlen(ai_direction));
+}
+
+const char *config_manager_get_ai_direction(void)
+{
+    return ai_direction;
 }
 
 void config_manager_set_deep_sleep_enabled(bool enabled)

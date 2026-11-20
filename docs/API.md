@@ -204,6 +204,11 @@ Get current device configuration.
   "ha_url": "",
   "openai_api_key": "",
   "google_api_key": "",
+  "ai_url": "https://openrouter.ai/api/v1/images",
+  "ai_image_model": "google/gemini-3.1-flash-image",
+  "ai_direction": "",
+  "weather_latitude": 51.2361,
+  "weather_longitude": -0.5762,
   "deep_sleep_enabled": true,
   "low_battery_indicator": true,
   "low_battery_threshold": 10
@@ -235,7 +240,15 @@ Get current device configuration.
   and convert it to a single cron rule. (To avoid rotating at night, bound the
   active hours in the cron rules, e.g. `0 7-23/2 *`, or split overnight coverage
   into two rules — there is no separate quiet-hours setting.)
-- `rotation_mode`: `"storage"` (local SD/flash) or `"url"` (fetch from URL)
+- `rotation_mode`: what a rotation tick puts on the panel.
+  - `"storage"` — rotate through the enabled albums on local storage, per `sd_rotation_mode`
+  - `"url"` — fetch `image_url` (an HTTP `304` means the panel is left alone)
+  - `"ai"` — generate the day's picture on-device from the local weather; see
+    [Daily generation](#daily-generation)
+
+  An unrecognised value is logged as unknown and falls back to `"storage"` rather
+  than being rejected, so an older client cannot be wedged by a mode it has never
+  heard of.
 - `sd_rotation_mode`: `"random"` or `"sequential"`
 - `image_url`: URL to fetch images from (max 256 chars)
 - `ca_cert_set`: Whether a custom CA certificate is pinned for HTTPS
@@ -248,6 +261,27 @@ Get current device configuration.
 - `save_downloaded_images`: Save fetched images to Downloads album
 - `ha_url`: Home Assistant URL for integration
 - `openai_api_key`/`google_api_key`: AI API keys for client-side generation
+- `ai_url`: the image generation endpoint (max 256 chars, must start with
+  `https://`). Defaults to OpenRouter's `/api/v1/images`. Must be HTTPS because
+  `openai_api_key` is sent to it as a bearer token.
+- `ai_image_model`: the image model name sent in the request body (max 128
+  chars, rejected with `400` rather than truncated). Defaults to
+  `google/gemini-3.1-flash-image`. Paired with `ai_url`: pointing at a
+  different endpoint while the model stays pinned is not a usable combination,
+  so both are exposed.
+- `ai_direction`: free text (max 512 chars, rejected rather than truncated)
+  folded into the prompt writer's system prompt as *the owner's standing
+  instructions, which take precedence*.
+  This is where the fixed parts of the brief live — where the frame hangs, what to
+  lean towards, what to avoid — so they can be edited by hand while the daily
+  cycle stays autonomous.
+- `weather_latitude` / `weather_longitude`: the location passed to the forecast
+  service (Open-Meteo), clamped to ±90 / ±180. This is the weather API's
+  location, not a parameter of the model: the coordinates are forwarded to the
+  prompt writer verbatim and it decides where to set the scene, so no place name
+  is configured anywhere. Out-of-range values are rejected with `400` and the
+  previous value is kept rather than clamped — a half-correct position would
+  produce a forecast for somewhere the frame is not.
 - `deep_sleep_enabled`: Enable deep sleep between rotations
 - `low_battery_indicator`: Draw an empty-battery icon on the picture when the battery is at or below `low_battery_threshold` (5-50 %). Not drawn on USB power, while charging, or when the frame has no battery reading
 
@@ -356,6 +390,10 @@ is no fallback to a local rotation) and answers `502 Bad Gateway` with
 `{ "status": "error", "message": "<reason>" }`; the same reason is reported as
 `last_fetch_error` by `GET /api/config`.
 
+In `ai` mode this call runs the whole daily cycle and blocks until it finishes —
+roughly a minute, dominated by the panel refresh rather than the generation. See
+[Daily generation](#daily-generation).
+
 ### `GET /api/current_image`
 
 Get the currently displayed image thumbnail.
@@ -363,6 +401,104 @@ Get the currently displayed image thumbnail.
 ### `POST /api/calibration/display`
 
 Display the color calibration pattern on the e-paper.
+
+---
+
+## Daily generation
+
+With `rotation_mode: "ai"`, a rotation tick makes the frame's picture instead of
+picking one. Three stages run on the device, each feeding the next:
+
+```
+Open-Meteo (weather_latitude/weather_longitude)
+      -> today's summary: date, weekday, temperature, sky, wind, light
+      -> prompt writer (a cheap text model) + ai_direction
+      -> image model (ai_image_model at ai_url)
+      -> base64 decoded in place -> dithered -> panel
+```
+
+The prompt writer deliberately costs about 1/200th of the image it produces
+(~$0.0002 against ~$0.045, in ~2 s), so spending a little on wording to avoid
+wasting a generation is cheap. Its system prompt names the medium — a six-colour
+e-ink display — and layers `ai_direction` on top as the owner's standing
+instructions. The coordinates go into the summary as raw numbers, so the model
+places the scene itself and no place name is configured.
+
+A full cycle measures about 54 s: weather ~1 s, prompting ~3.5 s, generation
+~11 s, decode + dither ~0.3 s, panel refresh ~29 s. The refresh is the
+bottleneck, not the model.
+
+Nothing is stored. The picture goes to the panel and nowhere else.
+
+### `POST /api/ai/daily`
+
+Start the cycle above with no arguments. This is what the schedule drives, and
+what you would call by hand to force today's picture.
+
+**Response:** `202 Accepted` when started, `409 Conflict` if a generation or a
+display update is already in progress, `500` if the worker could not start.
+
+```json
+{ "status": "accepted", "message": "Daily cycle started" }
+```
+
+### `POST /api/ai/generate`
+
+Start a generation from an explicit prompt, bypassing the weather and the prompt
+writer — useful for testing a wording without waiting on a forecast.
+
+**Request:**
+```json
+{ "prompt": "a chalk downland ridge under hard winter light" }
+```
+
+An empty string is rejected with `400` rather than treated as autonomous, so a
+client bug cannot silently change what gets generated. `409` if one is already
+running.
+
+### `GET /api/ai/status`
+
+**Response:**
+```json
+{
+  "state": "success",
+  "http_status": 200,
+  "response_bytes": 684598,
+  "image_bytes": 513088,
+  "elapsed_ms": 54413,
+  "busy": false
+}
+```
+
+`state` is one of `idle`, `weather`, `prompting`, `requesting`, `decoding`,
+`displaying`, `success`, `error`. `error` is omitted unless set, and carries the
+reason in `error` state.
+
+### Scheduling it
+
+The cron drives *when* and the mode drives *what*, so daily generation is:
+
+```json
+{ "rotation_mode": "ai", "auto_rotate": true, "rotate_cron": ["0 4 *"] }
+```
+
+`auto_rotate` must be on — with it off, no timer wake is armed at all and the
+frame only rotates on a button press. Cron hours are read in the device's
+`timezone`, which defaults to `UTC0`; a zone that observes DST needs a POSIX
+rule so the picture keeps arriving at the intended local hour across the
+changeover.
+
+An AI-mode wake brings the radio up for the weather fetch, and a wake with no WiFi
+sleeps again without rotating rather than failing the cycle in the dark — the
+panel keeps the picture it already has, and the missed wake counts against the
+network backoff so a frame out of range stops paying for a connect on every slot.
+
+A failed cycle *with* WiFi up deliberately does **not** touch that backoff. The
+backoff exists to describe a network that is not there, and by that point the
+network has proven it is: what is left to fail with is application-level — no API
+key, a `402` credit exhaustion, a model the account cannot use. Backing off for
+those would skip several days of pictures over a fault WiFi never had, and would
+keep skipping them after the key was fixed.
 
 ---
 

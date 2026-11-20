@@ -11,6 +11,8 @@
 #include <unistd.h>
 
 #include "album_manager.h"
+#include "ai_gen.h"
+#include "ai_prompt.h"
 #include "board_hal.h"
 #include "cJSON.h"
 #include "cert_pin.h"
@@ -213,6 +215,7 @@ static esp_err_t index_handler(httpd_req_t *req)
     const size_t index_html_size = (index_html_end - index_html_start);
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, (const char *) index_html_start, index_html_size);
     return ESP_OK;
 }
@@ -222,6 +225,7 @@ static esp_err_t index_css_handler(httpd_req_t *req)
     const size_t index_css_size = (index_css_end - index_css_start);
     httpd_resp_set_type(req, "text/css");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, (const char *) index_css_start, index_css_size);
     return ESP_OK;
 }
@@ -231,6 +235,7 @@ static esp_err_t index_js_handler(httpd_req_t *req)
     const size_t index_js_size = (index_js_end - index_js_start);
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, (const char *) index_js_start, index_js_size);
     return ESP_OK;
 }
@@ -240,6 +245,7 @@ static esp_err_t index2_js_handler(httpd_req_t *req)
     const size_t index2_js_size = (index2_js_end - index2_js_start);
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, (const char *) index2_js_start, index2_js_size);
     return ESP_OK;
 }
@@ -249,6 +255,7 @@ static esp_err_t exif_reader_js_handler(httpd_req_t *req)
     const size_t exif_reader_js_size = (exif_reader_js_end - exif_reader_js_start);
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, (const char *) exif_reader_js_start, exif_reader_js_size);
     return ESP_OK;
 }
@@ -258,6 +265,7 @@ static esp_err_t browser_js_handler(httpd_req_t *req)
     const size_t browser_js_size = (browser_js_end - browser_js_start);
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, (const char *) browser_js_start, browser_js_size);
     return ESP_OK;
 }
@@ -268,6 +276,7 @@ static esp_err_t vite_browser_external_js_handler(httpd_req_t *req)
         (vite_browser_external_js_end - vite_browser_external_js_start);
     httpd_resp_set_type(req, "application/javascript");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, (const char *) vite_browser_external_js_start,
                     vite_browser_external_js_size);
     return ESP_OK;
@@ -278,6 +287,7 @@ static esp_err_t icon_handler(httpd_req_t *req)
     const size_t icon_svg_size = (icon_svg_end - icon_svg_start);
     httpd_resp_set_type(req, "image/svg+xml");
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     httpd_resp_send(req, (const char *) icon_svg_start, icon_svg_size);
     return ESP_OK;
 }
@@ -1378,15 +1388,43 @@ static esp_err_t rotate_handler(httpd_req_t *req)
         cJSON_AddStringToObject(response, "status", "success");
         cJSON_AddStringToObject(response, "message", "Image rotation triggered");
     } else {
-        // A failed URL fetch keeps the current picture (nothing falls back to
-        // a local rotation any more), so the caller must hear that nothing
-        // changed rather than "success". The reason is what the fetch left in
-        // last_fetch_error.
-        const char *why = utils_get_last_fetch_error();
+        // A failed rotation keeps the current picture (nothing falls back to a
+        // local rotation any more), so the caller must hear that nothing
+        // changed rather than "success". Where the reason lives depends on the
+        // mode: a URL fetch leaves it in last_fetch_error, but a failed
+        // generation leaves it on the AI worker. Reading the wrong one reports
+        // a stale URL error for an AI failure, which sends you looking in the
+        // wrong place entirely.
+        rotation_mode_t mode = config_manager_get_rotation_mode();
+        const char *why = NULL;
+        const char *fallback = "Failed to fetch image from URL";
+
+        if (mode == ROTATION_MODE_AI) {
+            // Resolve the reason from the generation worker only. last_fetch_error
+            // belongs to URL mode, and reading it for an AI failure reports a
+            // stale failure from a mode nobody is using.
+            fallback = "Daily generation failed";
+            if (rotated == ESP_ERR_TIMEOUT) {
+                // The worker is still running, so its error field still holds
+                // whatever the *previous* run left there. Do not quote it.
+                why = "Daily generation timed out";
+            } else {
+                ai_gen_status_t st;
+                ai_gen_get_status(&st);
+                // Only quote a run that actually ended in error. A refusal -- a
+                // rotate pressed while a generation is already in flight --
+                // leaves the previous run's text sitting in this field.
+                if (st.state == AI_STATE_ERROR && st.error[0] != '\0') {
+                    why = st.error;
+                }
+            }
+        } else {
+            why = utils_get_last_fetch_error();
+        }
+
         httpd_resp_set_status(req, "502 Bad Gateway");
         cJSON_AddStringToObject(response, "status", "error");
-        cJSON_AddStringToObject(response, "message",
-                                why && why[0] ? why : "Failed to fetch image from URL");
+        cJSON_AddStringToObject(response, "message", why && why[0] ? why : fallback);
     }
 
     char *json_str = cJSON_Print(response);
@@ -1398,6 +1436,159 @@ static esp_err_t rotate_handler(httpd_req_t *req)
 
     // The response above is complete either way. A handler error here would
     // only make esp_http_server close the session under a keep-alive client.
+    return ESP_OK;
+}
+
+#define AI_PROMPT_MAX_LEN 2000
+
+// Maps an ai_gen_start() result onto an HTTP response. Shared by the two start
+// endpoints so their busy/error semantics cannot drift apart as states are added.
+static esp_err_t respond_start_result(httpd_req_t *req, esp_err_t started, const char *ok_message,
+                                     const char *fail_message)
+{
+    cJSON *response = cJSON_CreateObject();
+    httpd_resp_set_type(req, "application/json");
+
+    if (started == ESP_ERR_INVALID_STATE) {
+        bool display_busy = display_manager_is_busy();
+        httpd_resp_set_status(req, "409 Conflict");
+        cJSON_AddStringToObject(response, "status", display_busy ? "busy" : "error");
+        cJSON_AddStringToObject(response, "message",
+                               display_busy ? "Display is currently updating, please wait"
+                                           : "A generation is already in progress");
+    } else if (started != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        cJSON_AddStringToObject(response, "status", "error");
+        cJSON_AddStringToObject(response, "message", fail_message);
+    } else {
+        // 202: accepted, work happening elsewhere. The caller polls for the result.
+        httpd_resp_set_status(req, "202 Accepted");
+        cJSON_AddStringToObject(response, "status", "accepted");
+        cJSON_AddStringToObject(response, "message", ok_message);
+    }
+
+    char *json_str = cJSON_Print(response);
+    httpd_resp_sendstr(req, json_str);
+    free(json_str);
+    cJSON_Delete(response);
+    return ESP_OK;
+}
+
+// POST /api/ai/generate {"prompt":"..."} -- starts a generation and returns
+// straight away. Generation takes 6-12 s and the panel refresh another ~15 s, so
+// the result is polled from /api/ai/status rather than held here.
+static esp_err_t ai_generate_handler(httpd_req_t *req)
+{
+    if (!system_ready) {
+        httpd_resp_set_status(req, HTTPD_503);
+        httpd_resp_sendstr(req, "System is still initializing");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len == 0 || req->content_len > 4096) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request body missing or too large");
+        return ESP_FAIL;
+    }
+
+    char *buf = malloc(req->content_len + 1);
+    if (!buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
+
+    int received = 0;
+    while (received < req->content_len) {
+        int ret = httpd_req_recv(req, buf + received, req->content_len - received);
+        if (ret <= 0) {
+            free(buf);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to receive data");
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+    buf[received] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, "prompt");
+    const char *prompt = cJSON_IsString(item) ? cJSON_GetStringValue(item) : NULL;
+    if (!prompt || prompt[0] == '\0') {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing required field: prompt");
+        return ESP_FAIL;
+    }
+    if (strlen(prompt) > AI_PROMPT_MAX_LEN) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Prompt too long");
+        return ESP_FAIL;
+    }
+
+    esp_err_t started = ai_gen_start(prompt);
+    cJSON_Delete(root);
+
+    return respond_start_result(req, started, "Generation started", "Failed to start generation");
+}
+
+// POST /api/ai/daily -- the whole daily cycle with no arguments: fetch today's
+// forecast, have the text model write the prompt, generate, display. This is what
+// the morning schedule calls, and the body is ignored if one is sent.
+static esp_err_t ai_daily_handler(httpd_req_t *req)
+{
+    if (!system_ready) {
+        httpd_resp_set_status(req, HTTPD_503);
+        httpd_resp_sendstr(req, "System is still initializing");
+        return ESP_FAIL;
+    }
+
+    return respond_start_result(req, ai_gen_start(NULL), "Daily cycle started",
+                               "Failed to start the daily cycle");
+}
+
+// GET /api/ai/status -- progress for the worker above.
+// POST /api/ai/warning-preview -- draw the "generation failing" screen now.
+//
+// The screen otherwise only appears after seven consecutive failed days, which
+// is not a thing anyone can wait for to check that it renders. Costs nothing and
+// changes no configuration; it just repaints the panel.
+static esp_err_t ai_warning_preview_handler(httpd_req_t *req)
+{
+    esp_err_t err = display_manager_show_warning("Generation failing", "Press BOOT, then open",
+                                                 "photoframe.local");
+    httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK) {
+        httpd_resp_sendstr(req, "{\"status\":\"success\"}");
+    } else {
+        httpd_resp_sendstr(req, "{\"status\":\"error\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t ai_status_handler(httpd_req_t *req)
+{
+    ai_gen_status_t st;
+    ai_gen_get_status(&st);
+
+    cJSON *response = cJSON_CreateObject();
+    cJSON_AddStringToObject(response, "state", ai_gen_state_name(st.state));
+    cJSON_AddNumberToObject(response, "http_status", st.http_status);
+    cJSON_AddNumberToObject(response, "response_bytes", (double)st.response_bytes);
+    cJSON_AddNumberToObject(response, "image_bytes", (double)st.image_bytes);
+    cJSON_AddNumberToObject(response, "elapsed_ms", (double)st.elapsed_ms);
+    cJSON_AddBoolToObject(response, "busy", ai_gen_is_busy());
+    if (st.error[0] != '\0') {
+        cJSON_AddStringToObject(response, "error", st.error);
+    }
+
+    char *json_str = cJSON_Print(response);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, json_str);
+    free(json_str);
+    cJSON_Delete(response);
     return ESP_OK;
 }
 
@@ -1584,11 +1775,11 @@ static esp_err_t config_handler(httpd_req_t *req)
             }
         }
         cJSON_AddItemToObject(root, "rotate_cron", cron_arr);
-        const char *rotation_mode_str = "storage";
-        rotation_mode_t rm = config_manager_get_rotation_mode();
-        if (rm == ROTATION_MODE_URL)
-            rotation_mode_str = "url";
-        cJSON_AddStringToObject(root, "rotation_mode", rotation_mode_str);
+        // Named through the shared table rather than a local ternary: a mode that
+        // this did not know about would otherwise be reported as "storage" while
+        // behaving as something else entirely.
+        cJSON_AddStringToObject(root, "rotation_mode",
+                               config_manager_rotation_mode_str(config_manager_get_rotation_mode()));
 
         // Auto Rotate - SDCARD
         cJSON_AddStringToObject(root, "sd_rotation_mode",
@@ -1634,11 +1825,51 @@ static esp_err_t config_handler(httpd_req_t *req)
         const char *ha_url = config_manager_get_ha_url();
         cJSON_AddStringToObject(root, "ha_url", ha_url ? ha_url : "");
 
-        // AI API Keys
-        const char *openai_key = config_manager_get_openai_api_key();
-        const char *google_key = config_manager_get_google_api_key();
-        cJSON_AddStringToObject(root, "openai_api_key", openai_key ? openai_key : "");
-        cJSON_AddStringToObject(root, "google_api_key", google_key ? google_key : "");
+        // The frame's key. The browser's client-side generation was removed, so
+        // there is exactly one key and one consumer again.
+        const char *ai_key = config_manager_get_ai_api_key();
+        cJSON_AddStringToObject(root, "ai_api_key", ai_key ? ai_key : "");
+
+        // Generation: the endpoint/model pair, and the owner's standing creative
+        // instructions. The weather location is separate -- it belongs to the
+        // forecast service, not to the model.
+        cJSON_AddStringToObject(root, "ai_url", config_manager_get_ai_url());
+        cJSON_AddStringToObject(root, "ai_image_model", config_manager_get_ai_image_model());
+        const char *ai_direction = config_manager_get_ai_direction();
+        cJSON_AddStringToObject(root, "ai_direction", ai_direction ? ai_direction : "");
+        // The writer is a separate endpoint/model pair; the place is the coarse
+        // area the prose is written for, distinct from the coordinates below.
+        cJSON_AddStringToObject(root, "ai_writer_url", config_manager_get_ai_writer_url());
+        cJSON_AddStringToObject(root, "ai_writer_model", config_manager_get_ai_writer_model());
+        const char *ai_place = config_manager_get_ai_place();
+        cJSON_AddStringToObject(root, "ai_place", ai_place ? ai_place : "");
+        // The template in use (empty = compiled default) and the default itself,
+        // so the editor can offer a reset and show what differs.
+        // The preference order as an array; the first entry is the model in use.
+        const char *order_csv = config_manager_get_ai_model_order();
+        cJSON *order_arr = cJSON_AddArrayToObject(root, "ai_model_order");
+        if (order_arr) {
+            const char *p = order_csv;
+            while (p && *p) {
+                const char *comma = strchr(p, ',');
+                size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                char one[AI_MODEL_MAX_LEN];
+                if (len < sizeof(one)) {
+                    memcpy(one, p, len);
+                    one[len] = '\0';
+                    cJSON_AddItemToArray(order_arr, cJSON_CreateString(one));
+                }
+                p = comma ? comma + 1 : NULL;
+            }
+        }
+        cJSON_AddNumberToObject(root, "ai_fail_streak", config_manager_get_ai_fail_streak());
+        const char *ai_tmpl = config_manager_get_ai_template();
+        cJSON_AddStringToObject(root, "ai_prompt_template", ai_tmpl ? ai_tmpl : "");
+        cJSON_AddStringToObject(root, "ai_prompt_template_default", ai_prompt_default_template());
+
+        // Weather location for the daily prompt
+        cJSON_AddNumberToObject(root, "weather_latitude", config_manager_get_weather_latitude());
+        cJSON_AddNumberToObject(root, "weather_longitude", config_manager_get_weather_longitude());
 
         // Other
         cJSON_AddBoolToObject(root, "deep_sleep_enabled", config_manager_get_deep_sleep_enabled());
@@ -1658,7 +1889,9 @@ static esp_err_t config_handler(httpd_req_t *req)
         return ESP_OK;
     } else if (req->method == HTTP_POST || req->method == HTTP_PATCH) {
         size_t buf_size = req->content_len + 1;
-        if (buf_size > 4096) {
+        // A prompt template can be up to AI_TEMPLATE_MAX_LEN, and JSON escaping
+        // grows it further, so the config body ceiling cannot stay at 4 KB.
+        if (buf_size > AI_TEMPLATE_MAX_LEN + 4096) {
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request body too large");
             return ESP_FAIL;
         }
@@ -2621,6 +2854,13 @@ esp_err_t http_server_init(void)
         register_uri("/measurement_sample.jpg", HTTP_GET, measurement_sample_handler);
 
         register_uri("/api/rotate", HTTP_POST, rotate_handler);
+
+        register_uri("/api/ai/generate", HTTP_POST, ai_generate_handler);
+
+        register_uri("/api/ai/daily", HTTP_POST, ai_daily_handler);
+
+        register_uri("/api/ai/status", HTTP_GET, ai_status_handler);
+        register_uri("/api/ai/warning-preview", HTTP_POST, ai_warning_preview_handler);
 
         register_uri("/api/current_image", HTTP_GET, current_image_handler);
 

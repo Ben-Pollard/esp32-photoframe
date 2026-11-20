@@ -63,11 +63,24 @@ export const useSettingsStore = defineStore("settings", () => {
     lowBatteryThreshold: 10,
     // Debugging
     debugLogEnabled: false,
-    // AI API Keys (for client-side AI generation)
-    aiCredentials: {
-      openaiApiKey: "",
-      googleApiKey: "",
-    },
+    // AI generation on the device
+    aiApiKey: "",
+    aiUrl: "",
+    aiImageModel: "",
+    // Ordered preference list; the first entry is the model in use. This is the
+    // only thing sent -- ai_image_model is the device's derived head and is
+    // never written from here, so the two cannot disagree.
+    aiModelOrder: [],
+    aiWriterUrl: "",
+    aiWriterModel: "",
+    aiPlace: "",
+    aiDirection: "",
+    // Empty when the compiled default is in use.
+    aiPromptTemplate: "",
+    aiPromptTemplateDefault: "",
+    // Location used for the forecast, kept beside the place it is described as
+    weatherLatitude: null,
+    weatherLongitude: null,
   });
 
   // ... (existing code)
@@ -240,9 +253,21 @@ export const useSettingsStore = defineStore("settings", () => {
       // Don't load password from server for security
       deviceSettings.value.wifiPassword = "";
 
-      // AI API Keys (for client-side AI generation)
-      deviceSettings.value.aiCredentials.openaiApiKey = data.openai_api_key || "";
-      deviceSettings.value.aiCredentials.googleApiKey = data.google_api_key || "";
+      // AI generation on the device
+      deviceSettings.value.aiApiKey = data.ai_api_key || "";
+      deviceSettings.value.aiUrl = data.ai_url || "";
+      deviceSettings.value.aiImageModel = data.ai_image_model || "";
+      deviceSettings.value.aiModelOrder = Array.isArray(data.ai_model_order)
+        ? [...data.ai_model_order]
+        : [];
+      deviceSettings.value.aiWriterUrl = data.ai_writer_url || "";
+      deviceSettings.value.aiWriterModel = data.ai_writer_model || "";
+      deviceSettings.value.aiPlace = data.ai_place || "";
+      deviceSettings.value.aiPromptTemplate = data.ai_prompt_template || "";
+      deviceSettings.value.aiPromptTemplateDefault = data.ai_prompt_template_default || "";
+      deviceSettings.value.aiDirection = data.ai_direction || "";
+      deviceSettings.value.weatherLatitude = data.weather_latitude ?? null;
+      deviceSettings.value.weatherLongitude = data.weather_longitude ?? null;
 
       deviceSettings.value.timezone = data.timezone || "UTC0";
       savedTimezone.value = deviceSettings.value.timezone;
@@ -276,6 +301,11 @@ export const useSettingsStore = defineStore("settings", () => {
     return { value: httpPassword };
   }
 
+  // A select/combobox can hand back an option object rather than its value; a
+  // model id that arrives as an object is silently ignored by the device, so
+  // coerce here as well as at the widget.
+  const asId = (v) => (v && typeof v === "object" ? (v.value ?? "") : v);
+
   async function saveDeviceSettings() {
     const currentConfig = {
       auto_rotate: deviceSettings.value.autoRotate,
@@ -303,8 +333,16 @@ export const useSettingsStore = defineStore("settings", () => {
       http_header_key: deviceSettings.value.httpHeaderKey,
       http_header_value: deviceSettings.value.httpHeaderValue,
       wifi_ssid: deviceSettings.value.wifiSsid,
-      openai_api_key: deviceSettings.value.aiCredentials.openaiApiKey,
-      google_api_key: deviceSettings.value.aiCredentials.googleApiKey,
+      ai_api_key: deviceSettings.value.aiApiKey,
+      ai_url: deviceSettings.value.aiUrl,
+      ai_model_order: [...(deviceSettings.value.aiModelOrder || [])],
+      ai_writer_url: deviceSettings.value.aiWriterUrl,
+      ai_writer_model: asId(deviceSettings.value.aiWriterModel),
+      ai_place: deviceSettings.value.aiPlace,
+      ai_prompt_template: deviceSettings.value.aiPromptTemplate,
+      ai_direction: deviceSettings.value.aiDirection,
+      weather_latitude: deviceSettings.value.weatherLatitude,
+      weather_longitude: deviceSettings.value.weatherLongitude,
     };
 
     // Only include password if it's been changed (not empty)

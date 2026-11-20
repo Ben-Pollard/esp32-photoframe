@@ -80,16 +80,6 @@ const features = [
   },
 ];
 
-const appFeatures = [
-  { icon: "mdi-access-point-network", text: "Auto discovery" },
-  { icon: "mdi-image-multiple", text: "Gallery management" },
-  { icon: "mdi-auto-fix", text: "AI generation" },
-  { icon: "mdi-wifi", text: "WiFi setup" },
-  { icon: "mdi-cog", text: "Device settings" },
-  { icon: "mdi-update", text: "OTA updates" },
-  { icon: "mdi-camera", text: "Camera upload" },
-  { icon: "mdi-palette", text: "Image processing" },
-];
 
 // Image state
 const fileInput = ref(null);
@@ -278,7 +268,6 @@ function scrollTo(id) {
           <a @click.prevent="scrollTo('demo')">Demo</a>
           <a @click.prevent="scrollTo('hardware')">Hardware</a>
           <a @click.prevent="scrollTo('flash')">Flash</a>
-          <a @click.prevent="scrollTo('companion-app')">App</a>
         </nav>
         <div class="nav-meta">
           <span class="version-chip">{{ stableVersion }}</span>
@@ -607,62 +596,7 @@ function scrollTo(id) {
         </div>
       </section>
 
-      <!-- ────────────────────────────────────────  COMPANION  ──────────────────────────────────── -->
-      <section id="companion-app" class="section section-app">
-        <div class="app-canvas">
-          <img
-            class="app-graphic"
-            :src="`${baseUrl}feature_graphic.png`"
-            alt="ESP Frame companion app"
-          />
-          <div class="app-text">
-            <div class="section-head section-head-light">
-              <span class="section-kicker">Companion app</span>
-            </div>
-            <h2 class="section-title section-title-light">
-              The frame, in <em class="wonk">your</em> pocket.
-            </h2>
-            <p class="section-lede section-lede-light">
-              Discover devices on your network, browse galleries, generate AI images, and manage
-              settings — all without opening a browser. In public testing now.
-            </p>
-            <div class="app-stores">
-              <a
-                href="https://apps.apple.com/tw/app/esp-frame/id6762510995?l=en-GB"
-                target="_blank"
-                rel="noopener"
-                class="store"
-              >
-                <v-icon icon="mdi-apple" size="28" />
-                <div>
-                  <span class="store-os">App Store</span>
-                  <span class="store-track">USD 2.99</span>
-                </div>
-              </a>
-              <a
-                href="https://play.google.com/store/apps/details?id=com.aitjcize.espframe"
-                target="_blank"
-                rel="noopener"
-                class="store"
-              >
-                <v-icon icon="mdi-google-play" size="28" />
-                <div>
-                  <span class="store-os">Google Play</span>
-                  <span class="store-track">Free</span>
-                </div>
-              </a>
-            </div>
-            <div class="app-features">
-              <span v-for="f in appFeatures" :key="f.text" class="app-feature">
-                <v-icon :icon="f.icon" size="16" />
-                {{ f.text }}
-              </span>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- ─────────────────────────────────────────  ECOSYSTEM  ─────────────────────────────────── -->
+<!-- ─────────────────────────────────────────  ECOSYSTEM  ─────────────────────────────────── -->
       <section class="section section-eco">
         <div class="section-head">
           <span class="section-kicker">The whole stack</span>

@@ -34,3 +34,13 @@ demo/waveshare_photopainter_73
 demo/seeedstudio_xiao_ee02
 demo/seeedstudio_xiao_ee04
 demo/seeedstudio_reterminal_e1002
+
+.agents
+opencode.json
+.env
+
+# Local exploration (prompt lab, scenarios, run artefacts)
+/ai-lab/
+
+# Editor state
+.vscode/

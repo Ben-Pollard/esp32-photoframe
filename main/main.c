@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include "album_manager.h"
+#include "ai_gen.h"
 #include "board_hal.h"
 #include "color_palette.h"
 #include "config.h"
@@ -138,6 +139,61 @@ static esp_err_t connect_to_wifi(void)
     return err;
 }
 
+// Erase ONLY the WiFi credentials and restart into captive-portal setup.
+//
+// This is the one destructive path reachable without the web UI, so it is kept
+// deliberately narrow: the AI key, model, place and template all survive. It is
+// what makes the frame handoverable -- a device moved to a network it was never
+// provisioned for would otherwise retry the old SSID forever and never expose a
+// UI (connect failure for an absent SSID is ESP_ERR_TIMEOUT, which is
+// intentionally not treated as "forget the network").
+static void erase_wifi_and_restart(const char *why)
+{
+    ESP_LOGW(TAG, "%s -- erasing WiFi credentials and restarting into setup", why);
+    nvs_handle_t nvs_handle;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle) == ESP_OK) {
+        nvs_erase_key(nvs_handle, NVS_WIFI_SSID_KEY);
+        nvs_erase_key(nvs_handle, NVS_WIFI_PASS_KEY);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
+    // Show something is happening on the panel before the restart.
+    splash_screen_display();
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+}
+
+#define WIFI_RESET_HOLD_MS 5000
+
+// Pressing BOOT is how the frame is woken, so a long hold at wake is the only
+// gesture available on a sleeping device. A normal wake press is a few hundred
+// milliseconds; five seconds is unambiguous.
+//
+// Note this cannot be done by holding BOOT while applying power: that is the
+// ESP32 download-mode strap. The gesture is "wake it, keep holding".
+static void check_wifi_reset_hold(void)
+{
+    if (BOARD_HAL_WAKEUP_KEY == GPIO_NUM_NC) {
+        return;
+    }
+    if (gpio_get_level(BOARD_HAL_WAKEUP_KEY) != 0) {
+        return;
+    }
+
+    ESP_LOGW(TAG, "BOOT held at wake -- keep holding %d ms to reset WiFi",
+             WIFI_RESET_HOLD_MS);
+    int held = 0;
+    while (gpio_get_level(BOARD_HAL_WAKEUP_KEY) == 0 && held < WIFI_RESET_HOLD_MS) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        held += 100;
+    }
+    if (held < WIFI_RESET_HOLD_MS) {
+        ESP_LOGI(TAG, "BOOT released after %d ms -- WiFi settings kept", held);
+        return;
+    }
+    erase_wifi_and_restart("BOOT held at wake");
+}
+
 // The saved network can't be joined: drop its credentials and restart into
 // captive-portal provisioning. Does not return.
 static void forget_wifi_and_reprovision(void)
@@ -252,7 +308,9 @@ static void button_task(void *arg)
             } else if (current_boot_state == 1 && last_boot_state == 0) {
                 uint32_t duration = (xTaskGetTickCount() - boot_press_time) * portTICK_PERIOD_MS;
 
-                if (duration > 50 && duration < 3000) {
+                if (duration >= WIFI_RESET_HOLD_MS) {
+                    erase_wifi_and_restart("BOOT held");
+                } else if (duration > 50 && duration < 3000) {
                     ESP_LOGI(TAG, "Boot button pressed, resetting sleep timer");
                     power_manager_reset_sleep_timer();
                 }
@@ -366,10 +424,15 @@ void deep_sleep_wake_main(wakeup_source_t wakeup_src)
         // Won't reach here after sleep
     }
 
-    // Initialize WiFi if needed (URL mode always needs it, SD card mode only if HA configured)
-    if (rotation_mode == ROTATION_MODE_URL || ha_configured) {
+    // Initialize WiFi if needed (URL and AI modes always need it, SD card mode
+    // only if HA configured). AI mode needs it for the weather fetch as much as
+    // for the generation call -- there is no part of the daily cycle that works
+    // offline.
+    if (rotation_mode == ROTATION_MODE_URL || rotation_mode == ROTATION_MODE_AI || ha_configured) {
         ESP_LOGI(TAG, "Initializing WiFi for %s",
-                 rotation_mode == ROTATION_MODE_URL ? "URL rotation" : "HA battery post");
+                 rotation_mode == ROTATION_MODE_URL    ? "URL rotation"
+                 : rotation_mode == ROTATION_MODE_AI   ? "daily generation"
+                                                     : "HA battery post");
         ESP_ERROR_CHECK(wifi_manager_init());
 
         if (connect_to_wifi() == ESP_OK) {
@@ -408,13 +471,17 @@ void deep_sleep_wake_main(wakeup_source_t wakeup_src)
     bool should_rotate = true;
     bool ha_unreachable = false;
 
-    // URL mode without a network has nothing to do: the fetch would only
-    // fail three times in a row, and the panel keeps its picture either way.
-    // A scheduled wake counts it against the backoff so a frame out of WiFi
-    // range stops paying for a connect attempt on every slot (#121); a
-    // ROTATE press just goes back to sleep, its outcome not counted.
-    if (!wifi_connected && rotation_mode == ROTATION_MODE_URL) {
-        ESP_LOGW(TAG, "No network for URL rotation; keeping the current picture");
+    // URL and AI modes without a network have nothing to do: the former would
+    // only fail the fetch three times in a row, the latter would fail the
+    // weather fetch before it ever reached the model, and the panel keeps its
+    // picture either way. A scheduled wake counts it against the backoff so a
+    // frame out of WiFi range stops paying for a connect attempt on every
+    // slot (#121); a ROTATE press just goes back to sleep, its outcome not
+    // counted.
+    if (!wifi_connected &&
+        (rotation_mode == ROTATION_MODE_URL || rotation_mode == ROTATION_MODE_AI)) {
+        ESP_LOGW(TAG, "No network for %s rotation; keeping the current picture",
+                 config_manager_rotation_mode_str(rotation_mode));
         utils_set_last_fetch_error("WiFi unavailable");
         power_manager_record_network_wake(false);
         power_manager_enter_sleep();
@@ -458,8 +525,20 @@ void deep_sleep_wake_main(wakeup_source_t wakeup_src)
     // skip pictures the frame can show from its own storage to save one
     // bounded connect attempt. The backoff only takes note on a timer wake,
     // never on a ROTATE button press.
+    //
+    // An AI-mode failure must not speak to the backoff at all. That mechanism
+    // exists so a frame out of WiFi range stops paying for a connect on every
+    // slot -- but a wake that never got WiFi already slept back at the check
+    // above, so by here the network has proven it works. What is left to fail
+    // with is application-level: no API key, a 402 from the provider, a model
+    // the account cannot use, a prompt writer that mangled its answer. Charging
+    // those to the failure counter would lengthen a hold that reaches six hours,
+    // so a spent key would quietly skip several days of pictures and keep
+    // skipping them after the key is fixed.
     power_manager_reset_sleep_timer();
-    power_manager_record_network_wake(trigger_image_rotation() == ESP_OK);
+    esp_err_t rotated = trigger_image_rotation();
+    bool network_fault = (rotated != ESP_OK) && (rotation_mode != ROTATION_MODE_AI);
+    power_manager_record_network_wake(!network_fault);
 
     // Notify HA that data has been updated (after both OTA check and rotation)
     if (wifi_connected && ha_configured) {
@@ -549,6 +628,10 @@ void app_main(void)
     ESP_ERROR_CHECK(ret);
 
     ESP_ERROR_CHECK(config_manager_init());
+
+    // Before anything touches WiFi: a long hold at wake means "I have moved this
+    // frame to another network, let me set it up".
+    check_wifi_reset_hold();
 
     // Start mirroring console logs to storage if debug logging is enabled.
     debug_log_init();
@@ -645,6 +728,8 @@ void app_main(void)
     ESP_ERROR_CHECK(power_manager_init());
 
     ESP_ERROR_CHECK(ota_manager_init());
+
+    ESP_ERROR_CHECK(ai_gen_init());
 
     ESP_ERROR_CHECK(album_manager_init());
 

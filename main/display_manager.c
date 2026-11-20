@@ -1,5 +1,7 @@
 #include "display_manager.h"
 
+#include "label_font.h"
+
 #include <dirent.h>
 #include <string.h>
 #include <strings.h>
@@ -160,6 +162,156 @@ static void badge_fill(bool rotated, int x0, int y0, int x1, int y1, UWORD color
             }
         }
     }
+}
+
+// Blits one string in the generated bitmap font, at 1:1 (no scaling, so the
+// glyph edges stay perfectly hard on the panel).
+static void draw_label_text(bool rotated, int x, int y, const char *s, UWORD ink)
+{
+    if (!s) {
+        return;
+    }
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c < LABEL_FONT_FIRST || c > LABEL_FONT_LAST) {
+            c = '?';
+        }
+        const uint16_t *rows = LABEL_FONT[c - LABEL_FONT_FIRST];
+        for (int ry = 0; ry < LABEL_FONT_H; ry++) {
+            uint16_t bits = rows[ry];
+            if (!bits) {
+                continue;
+            }
+            for (int rx = 0; rx < LABEL_FONT_W; rx++) {
+                if (bits & (1u << rx)) {
+                    badge_fill(rotated, x + rx, y + ry, x + rx, y + ry, ink);
+                }
+            }
+        }
+        x += LABEL_FONT_W;
+    }
+}
+
+// Same font, integer-scaled for a message screen.
+static void draw_label_text_scaled(bool rotated, int x, int y, const char *s, UWORD ink, int scale)
+{
+    if (!s) {
+        return;
+    }
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c < LABEL_FONT_FIRST || c > LABEL_FONT_LAST) {
+            c = '?';
+        }
+        const uint16_t *rows = LABEL_FONT[c - LABEL_FONT_FIRST];
+        for (int ry = 0; ry < LABEL_FONT_H; ry++) {
+            uint16_t bits = rows[ry];
+            if (!bits) {
+                continue;
+            }
+            for (int rx = 0; rx < LABEL_FONT_W; rx++) {
+                if (bits & (1u << rx)) {
+                    int px = x + rx * scale;
+                    int py = y + ry * scale;
+                    badge_fill(rotated, px, py, px + scale - 1, py + scale - 1, ink);
+                }
+            }
+        }
+        x += LABEL_FONT_W * scale;
+    }
+}
+
+static int label_width(const char *s, int scale)
+{
+    int n = 0;
+    for (; s && *s; s++) {
+        n++;
+    }
+    return n * LABEL_FONT_W * scale;
+}
+
+esp_err_t display_manager_show_warning(const char *headline, const char *line1, const char *line2)
+{
+    if (xSemaphoreTake(display_mutex, pdMS_TO_TICKS(DISPLAY_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        return ESP_FAIL;
+    }
+    const bool rotated =
+        (Paint.Width > Paint.Height) !=
+        (config_manager_get_display_orientation() == DISPLAY_ORIENTATION_LANDSCAPE);
+    const int view_w = rotated ? Paint.Height : Paint.Width;
+    const int view_h = rotated ? Paint.Width : Paint.Height;
+    const UWORD white = display_white_color();
+    const UWORD black = display_is_grayscale() ? 0x0 : EPD_7IN3E_BLACK;
+
+    Paint_Clear(white);
+
+    const int big = 2;
+    const int small = 1;
+    const int gap = 24;
+    const int h1 = LABEL_FONT_H * big;
+    const int h2 = LABEL_FONT_H * small;
+    const int total = h1 + gap + h2 + gap + h2;
+    int y = (view_h - total) / 2;
+
+    if (headline) {
+        int x = (view_w - label_width(headline, big)) / 2;
+        draw_label_text_scaled(rotated, x, y, headline, black, big);
+        y += h1 + gap;
+    }
+    if (line1) {
+        int x = (view_w - label_width(line1, small)) / 2;
+        draw_label_text_scaled(rotated, x, y, line1, black, small);
+        y += h2 + gap;
+    }
+    if (line2) {
+        int x = (view_w - label_width(line2, small)) / 2;
+        draw_label_text_scaled(rotated, x, y, line2, black, small);
+    }
+
+    ESP_LOGI(TAG, "Displaying warning: %s", headline ? headline : "");
+    epaper_display(epd_image_buffer);
+    unlink(CURRENT_IMAGE_LINK);
+    current_image[0] = '\0';
+
+    xSemaphoreGive(display_mutex);
+    return ESP_OK;
+}
+
+// A caption plate in the bottom-left: a light card with dark lettering. The card
+// is opaque, so the text reads regardless of what the picture is doing behind
+// it -- the alternative, lettering straight onto a photograph, is unreadable on
+// half of all days.
+static void draw_day_label(const char *s)
+{
+    if (!s || !s[0]) {
+        return;
+    }
+    const bool rotated =
+        (Paint.Width > Paint.Height) !=
+        (config_manager_get_display_orientation() == DISPLAY_ORIENTATION_LANDSCAPE);
+    const int view_w = rotated ? Paint.Height : Paint.Width;
+    const int view_h = rotated ? Paint.Width : Paint.Height;
+    const UWORD white = display_white_color();
+    const UWORD black = display_is_grayscale() ? 0x0 : EPD_7IN3E_BLACK;
+    const int margin = 16;
+    const int pad = 8;
+
+    int len = 0;
+    for (const char *p = s; *p; p++) {
+        len++;
+    }
+    const int text_w = len * LABEL_FONT_W;
+    const int box_w = text_w + 2 * pad;
+    const int box_h = LABEL_FONT_H + 2 * pad;
+    if (box_w + 2 * margin > view_w || box_h + 2 * margin > view_h) {
+        ESP_LOGW(TAG, "Label \"%s\" does not fit the panel; skipping", s);
+        return;
+    }
+    const int x0 = margin;
+    const int y0 = view_h - margin - box_h;
+
+    badge_fill(rotated, x0, y0, x0 + box_w - 1, y0 + box_h - 1, white);
+    draw_label_text(rotated, x0 + pad, y0 + pad, s, black);
 }
 
 static void draw_low_battery_badge(void)
@@ -529,6 +681,9 @@ esp_err_t display_manager_end_rgb_stream(bool show, const display_publish_t *pub
         }
 
         draw_low_battery_badge();
+        if (pub && pub->overlay_label) {
+            draw_day_label(pub->overlay_label);
+        }
 
         ESP_LOGI(TAG, "Starting e-paper display update (this takes ~30 seconds)");
         epaper_display(epd_image_buffer);

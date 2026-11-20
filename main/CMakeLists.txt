@@ -1,4 +1,6 @@
 set(SOURCES
+    "ai_gen.c"
+    "ai_prompt.c"
     "album_manager.c"
     "cert_pin.c"
     "color_palette.c"
@@ -26,6 +28,9 @@ set(SOURCES
     "cron.c"
     "utils.c"
     "http_auth.c"
+    "weather.c"
+    "weather_block.c"
+    "image_model_policy.c"
     "wifi_manager.c"
     "wifi_provisioning.c"
     "wifi_retry_policy.c"
