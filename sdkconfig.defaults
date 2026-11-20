@@ -86,3 +86,11 @@ CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=y
 # not substitute the bundle's self-signed GTS Root R4 for the cross-signed one
 # the server sends. Costs ~700 B of heap.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY=y
+
+# OTA rollback. A new image boots once in ESP_OTA_IMG_PENDING_VERIFY; if it does
+# not mark itself valid (ota_manager.c does this early in app_main), the
+# bootloader reverts to the previous slot. This is the only protection against
+# an OTA that bootloops -- there is no way to talk a remote owner through a
+# reflash. It changes the BOOTLOADER, so it cannot be delivered by an app-only
+# OTA: devices need one wired flash to gain it.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

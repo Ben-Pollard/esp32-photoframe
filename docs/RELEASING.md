@@ -112,12 +112,39 @@ After publishing, before telling anyone an update exists:
 6. `POST /api/ai/daily` → the frame generates and displays, proving the key and
    model order still work.
 
-## Known risk: no rollback
+## Rollback
 
-`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` is **not** set. An image that bootloops
-will not revert itself; the frame needs reflashing over USB. That is acceptable
-while the frame is on a desk and unacceptable for a handed-over frame, so enable
-rollback before treating OTA as a remote-repair mechanism.
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` is set in `sdkconfig.defaults`. That
+file is tracked; `sdkconfig` is not, so a setting made in menuconfig would vanish
+on the next machine -- always put bootloader options in `sdkconfig.defaults`.
 
-There is also no signature check: anyone able to publish a release to this
-repository can push firmware to the frame.
+Behaviour: a newly OTA'd image boots once in `ESP_OTA_IMG_PENDING_VERIFY`.
+`ota_manager_init()` marks it valid early in `app_main`; if the image resets
+before reaching that, the bootloader reverts to the previous slot.
+
+What this does and does not cover:
+
+- **Covers:** an image that crashes or hangs during early boot.
+- **Does not cover:** an image that boots, marks itself valid, and then
+  misbehaves. There is no runtime watchdog rollback.
+
+Two operational notes:
+
+- It lives in the **bootloader**, so it cannot be delivered by an app-only OTA.
+  A device built before this setting needs one wired flash to gain it.
+- A rolled-back device still advertises the newer release to `ota/check`, so
+  re-applying the same bad build simply loops. Fix or delete the release rather
+  than retrying it.
+
+Do not enable `CONFIG_APP_ANTI_ROLLBACK`; it blocks downgrades, which we do want
+to be able to do when testing.
+
+Testing rollback deliberately means publishing a build that hangs before
+`ota_manager_init()` and confirming the device comes back on the old version.
+That is destructive and slow (a full reflash to recover), so do it once OTA
+itself is verified, not before.
+
+## Known risk: no signature check
+
+Anyone able to publish a release to this repository can push firmware to the
+frame. Acceptable for a personal fork; state it in the handover notes.
