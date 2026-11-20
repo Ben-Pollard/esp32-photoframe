@@ -327,7 +327,9 @@ typedef enum { IP_MODE_DHCP = 0, IP_MODE_STATIC = 1 } ip_mode_t;
 #define AI_PROMPT_SYSTEM_MAX 8192
 
 // OTA Configuration
-#define GITHUB_API_URL "https://api.github.com/repos/aitjcize/esp32-photoframe/releases/latest"
+// The release channel this fork's OTA client reads. Pointed at our fork: the
+// upstream one would deliver firmware without any of this work.
+#define GITHUB_API_URL "https://api.github.com/repos/Ben-Pollard/esp32-photoframe/releases/latest"
 #define OTA_CHECK_INTERVAL_MS (24 * 60 * 60 * 1000)  // 24 hours
 
 #endif
