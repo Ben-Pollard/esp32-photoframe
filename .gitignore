@@ -44,3 +44,6 @@ opencode.json
 
 # Editor state
 .vscode/
+
+# OTA release asset staged for `gh release create`
+/esp32-photoframe-*.bin
